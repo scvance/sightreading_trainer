@@ -41,8 +41,7 @@ const midiSelect = document.getElementById("midi-select");
 const midiConnectBtn = document.getElementById("midi-connect");
 const staticClefsEl = document.getElementById("static-clefs");
 
-const playheadX = 120;
-const leadInPx = 120;
+let layout = { playheadX: 120, leadInPx: 120 };
 const pxPerBeat = 90;
 
 let state = {
@@ -59,6 +58,7 @@ let state = {
   midiInputs: [],
   midiAccess: null,
   midiInputId: null,
+  keySig: new Map(),
 };
 
 async function ensureVexFlow() {
@@ -118,6 +118,19 @@ function buildScale(key) {
   return { pcs, preferSharps };
 }
 
+function keySignatureAccidentals(key) {
+  const count = KEY_INFO[key]?.accidentals || 0;
+  const sharps = ["F", "C", "G", "D", "A", "E", "B"];
+  const flats = ["B", "E", "A", "D", "G", "C", "F"];
+  const map = new Map();
+  if (count > 0) {
+    sharps.slice(0, count).forEach((l) => map.set(l, "#"));
+  } else if (count < 0) {
+    flats.slice(0, Math.abs(count)).forEach((l) => map.set(l, "b"));
+  }
+  return map;
+}
+
 function pickPitch(prev, range, scale, spice = 0.2) {
   const [low, high] = range;
   const stepChoices = [-4, -3, -2, -1, 1, 2, 3, 4];
@@ -165,10 +178,10 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
   }
 
   let cumulative = 0;
-  const leadInBeats = (leadInPx - playheadX) / pxPerBeat;
+  const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
   events.forEach((ev) => {
     ev.offsetBeats = cumulative + leadInBeats;
-    ev.offsetPx = leadInPx + cumulative * pxPerBeat;
+    ev.offsetPx = layout.leadInPx + cumulative * pxPerBeat;
     ev.vex = ev.beats >= 2 ? "h" : ev.beats === 0.5 ? "8" : "q";
     cumulative += ev.beats;
   });
@@ -196,7 +209,7 @@ function renderSequence(seq, key) {
     group.style.left = `${ev.offsetPx}px`;
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     const width = 190;
-    const height = 230;
+    const height = 260;
     svg.setAttribute("width", width);
     svg.setAttribute("height", height);
     group.appendChild(svg);
@@ -222,13 +235,18 @@ function renderSequence(seq, key) {
       ? new VF.StaveNote({ clef: "bass", keys: bassKeys.map((k) => k.key), duration: ev.vex })
       : new VF.StaveNote({ clef: "bass", keys: ["d/3"], duration: `${ev.vex}r` });
 
+    const keySig = state.keySig;
     trebleKeys.forEach((k, idx) => {
-      if (k.accidental === "#") trebleNote.addModifier(new VF.Accidental("#"), idx);
-      if (k.accidental === "b") trebleNote.addModifier(new VF.Accidental("b"), idx);
+      const letter = k.key[0].toUpperCase();
+      if (k.accidental && keySig.get(letter) !== k.accidental) {
+        trebleNote.addModifier(new VF.Accidental(k.accidental), idx);
+      }
     });
     bassKeys.forEach((k, idx) => {
-      if (k.accidental === "#") bassNote.addModifier(new VF.Accidental("#"), idx);
-      if (k.accidental === "b") bassNote.addModifier(new VF.Accidental("b"), idx);
+      const letter = k.key[0].toUpperCase();
+      if (k.accidental && keySig.get(letter) !== k.accidental) {
+        bassNote.addModifier(new VF.Accidental(k.accidental), idx);
+      }
     });
 
     const trebleVoice = new VF.Voice({ num_beats: 4, beat_value: 4 }).setStrict(false);
@@ -248,7 +266,7 @@ function renderStaticClefs(key) {
   staticClefsEl.innerHTML = "";
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   const width = 150;
-  const height = 230;
+  const height = 260;
   svg.setAttribute("width", width);
   svg.setAttribute("height", height);
   staticClefsEl.appendChild(svg);
@@ -446,6 +464,13 @@ async function initMIDI() {
 let lastFrame = performance.now();
 let userPaused = false;
 
+function refreshLayout() {
+  const width = Math.round(staticClefsEl?.getBoundingClientRect().width || 120);
+  layout.playheadX = width;
+  layout.leadInPx = width;
+  document.documentElement.style.setProperty("--playhead-left", `${layout.playheadX}px`);
+}
+
 function tick(now) {
   const delta = (now - lastFrame) / 1000;
   lastFrame = now;
@@ -461,6 +486,7 @@ function tick(now) {
 
 function regenerate() {
   if (!VF) return;
+  refreshLayout();
   state.progressBeats = 0;
   state.stats = { correct: 0, mistakes: 0 };
   state.tricky = new Map();
@@ -472,6 +498,7 @@ function regenerate() {
   });
   state.sequence = events;
   state.preferSharps = preferSharps;
+  state.keySig = keySignatureAccidentals(state.key);
   renderStaticClefs(state.key);
   renderSequence(events, state.key);
   scoreEl.querySelectorAll(".note-group").forEach((g) => g.classList.remove("active"));
@@ -541,6 +568,7 @@ function startClock() {
 }
 
 async function init() {
+  refreshLayout();
   initKeySelect();
   bindControls();
   const ok = await ensureVexFlow();
