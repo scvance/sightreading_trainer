@@ -574,105 +574,728 @@ function addMidisToTarget(target, midis) {
   target.midis = [...new Set([...target.midis, ...midis])].sort((a, b) => a - b);
 }
 
+// ===================== MUSICAL RULE-BASED GENERATOR (ADD THIS BLOCK) =====================
+
+// --- constraints ---
+const MAX_HAND_NOTES = 5;            // <= 5 notes in one hand
+const MAX_HAND_SPAN_SEMITONES = 14;  // <= 9th (14 semitones)
+
+// Ranges (tweak if you want)
+const TREBLE_RANGE = [60, 88]; // C4..E6
+const BASS_RANGE   = [36, 64]; // C2..E4 (a bit higher to allow 9th spans safely)
+
+// --- helpers ---
+function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function choice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function weightedChoice(items) {
+  // items: [{w:number, v:any}, ...]
+  const sum = items.reduce((s, x) => s + x.w, 0);
+  let r = Math.random() * sum;
+  for (const it of items) {
+    r -= it.w;
+    if (r <= 0) return it.v;
+  }
+  return items[items.length - 1].v;
+}
+
+function parseTimeSig(ts) {
+  const [n, d] = ts.split("/").map(Number);
+  const beatsPerMeasure = n * (4 / d);
+  return { n, d, beatsPerMeasure };
+}
+
+function tonicPcFromKey(key) {
+  const preferSharps = (KEY_INFO[key]?.accidentals || 0) > 0;
+  const names = preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
+  const idx = names.indexOf(key);
+  // fallback for "C" etc if weird
+  return idx >= 0 ? idx : NOTE_NAMES_SHARP.indexOf(key);
+}
+
+function scalePcsForKey(key) {
+  const tonicPc = tonicPcFromKey(key);
+  return MAJOR_SCALE.map((step) => (tonicPc + step) % 12); // degree 1..7 in order
+}
+
+function chordPcsForDegree(deg, scalePcs, seventh = false) {
+  // deg: 1..7
+  const i = (deg - 1) % 7;
+  const pcs = [
+    scalePcs[i],
+    scalePcs[(i + 2) % 7],
+    scalePcs[(i + 4) % 7],
+  ];
+  if (seventh) pcs.push(scalePcs[(i + 6) % 7]);
+  return pcs;
+}
+
+function nearestMidiWithPc(targetMidi, pc) {
+  // pc in [0..11]
+  return pc + 12 * Math.round((targetMidi - pc) / 12);
+}
+
+function clampMidiToRange(m, range) {
+  let x = m;
+  while (x < range[0]) x += 12;
+  while (x > range[1]) x -= 12;
+  return clamp(x, range[0], range[1]);
+}
+
+function reduceSpanByOctaves(notes, range, maxSpan) {
+  // try octave folding before dropping notes
+  let n = notes.slice().sort((a, b) => a - b);
+  let guard = 0;
+  while (n.length >= 2 && (n[n.length - 1] - n[0]) > maxSpan && guard++ < 32) {
+    const low = n[0], high = n[n.length - 1];
+    // try pulling high down
+    if (high - 12 >= low && high - 12 >= range[0]) {
+      n[n.length - 1] = high - 12;
+      n.sort((a, b) => a - b);
+      continue;
+    }
+    // try pushing low up
+    if (low + 12 <= high && low + 12 <= range[1]) {
+      n[0] = low + 12;
+      n.sort((a, b) => a - b);
+      continue;
+    }
+    break;
+  }
+  return n;
+}
+
+function finalizeHandNotes(midis, range, maxNotes, maxSpan) {
+  let notes = [...new Set(midis)].map((m) => clampMidiToRange(m, range)).sort((a, b) => a - b);
+
+  // cap count
+  while (notes.length > maxNotes) {
+    // drop farthest from center
+    const center = (notes[0] + notes[notes.length - 1]) / 2;
+    const d0 = Math.abs(notes[0] - center);
+    const d1 = Math.abs(notes[notes.length - 1] - center);
+    if (d1 >= d0) notes.pop();
+    else notes.shift();
+  }
+
+  // reduce span by octaves, then drop if still too wide
+  notes = reduceSpanByOctaves(notes, range, maxSpan);
+  while (notes.length >= 2 && (notes[notes.length - 1] - notes[0]) > maxSpan) {
+    // drop farthest from center
+    const center = (notes[0] + notes[notes.length - 1]) / 2;
+    const d0 = Math.abs(notes[0] - center);
+    const d1 = Math.abs(notes[notes.length - 1] - center);
+    if (d1 >= d0) notes.pop();
+    else notes.shift();
+  }
+
+  return notes;
+}
+
+function nearestMidiInPcs(targetMidi, pcs, range) {
+  let best = null;
+  let bestDist = 1e9;
+  for (const pc of pcs) {
+    let m = nearestMidiWithPc(targetMidi, pc);
+    m = clampMidiToRange(m, range);
+    const dist = Math.abs(m - targetMidi);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = m;
+    }
+    // also check +/- octave variants (sometimes clamp pushes too far)
+    for (const off of [-12, 12]) {
+      const mm = clampMidiToRange(m + off, range);
+      const dd = Math.abs(mm - targetMidi);
+      if (dd < bestDist) {
+        bestDist = dd;
+        best = mm;
+      }
+    }
+  }
+  return best ?? clampMidiToRange(targetMidi, range);
+}
+
+function isStrongOffsetTicks(offsetTicks, measureTicks, timeSig) {
+  // simple musical accent grid by common meters
+  if (timeSig === "4/4") return offsetTicks === 0 || offsetTicks === 8;
+  if (timeSig === "3/4") return offsetTicks === 0;
+  if (timeSig === "6/8") return offsetTicks === 0 || offsetTicks === 6;
+  // fallback: start of measure is strong
+  return offsetTicks === 0;
+}
+
+function isMediumOffsetTicks(offsetTicks, measureTicks, timeSig) {
+  if (timeSig === "4/4") return offsetTicks === 4 || offsetTicks === 12;
+  if (timeSig === "3/4") return offsetTicks === 4 || offsetTicks === 8;
+  if (timeSig === "6/8") return offsetTicks === 3 || offsetTicks === 9;
+  return false;
+}
+
+// --- rhythm templates (tick sums must match measureTicks) ---
+function rhythmPatternsFor(timeSig, hand, difficulty) {
+  // NOTE: tick grid uses 1=16th, 2=8th, 3=dotted 8th, 4=quarter, 6=dotted quarter, 8=half, 12=dotted half, 16=whole
+  const D = difficulty;
+
+  const COMMON_44_T = [
+    [4,4,4,4],
+    [8,4,4],
+    [4,4,8],
+    [2,2,2,2,4,4],
+    [4,2,2,4,4],
+    [3,1,4,4,4],
+    [2,2,2,2,2,2,2,2],
+    [1,1,2,4,4,4], // 16th pickup burst
+  ];
+  const COMMON_34_T = [
+    [4,4,4],
+    [6,6],
+    [4,2,2,4],
+    [2,2,2,2,2,2],
+    [3,1,4,4],
+  ];
+  const COMMON_68_T = [
+    [2,2,2,2,2,2], // eighths
+    [3,3,3,3],     // dotted eighths
+    [6,6],         // dotted quarters
+  ];
+
+  let base = [];
+  if (timeSig === "4/4") base = COMMON_44_T;
+  else if (timeSig === "3/4") base = COMMON_34_T;
+  else if (timeSig === "6/8") base = COMMON_68_T;
+  else base = COMMON_44_T;
+
+  // Hand flavor: bass generally simpler / longer, treble more active on harder
+  if (hand === "bass") {
+    const bassBias = [];
+    base.forEach((p) => {
+      // keep simpler patterns more often
+      const w =
+        (p.length <= 3 ? 4 : 1) *
+        (D === "easy" ? 2 : D === "medium" ? 1.5 : 1.0);
+      bassBias.push({ w, v: p });
+    });
+    return bassBias;
+  }
+
+  // treble
+  const trebleBias = [];
+  base.forEach((p) => {
+    const has16th = p.includes(1);
+    const w =
+      (D === "easy" ? (p.length <= 4 && !has16th ? 3 : 1) :
+       D === "medium" ? (p.length <= 6 ? 2 : 1) :
+       (has16th ? 2.5 : 1.5));
+    trebleBias.push({ w, v: p });
+  });
+  return trebleBias;
+}
+
+function pickRhythmPatternExact(measureTicks, timeSig, hand, difficulty) {
+  const patterns = rhythmPatternsFor(timeSig, hand, difficulty);
+  // choose a pattern whose sum == measureTicks
+  const candidates = patterns.filter((x) => x.v.reduce((s, t) => s + t, 0) === measureTicks);
+  if (candidates.length) return weightedChoice(candidates);
+
+  // fallback to your DP filler if templates don't match
+  const pool = difficulty === "hard" ? [8,6,4,3,2,1] : difficulty === "medium" ? [8,6,4,3,2] : [8,6,4,2];
+  return fillMeasureTicks(measureTicks, pool);
+}
+
+// --- harmony templates (degrees in major key) ---
+const PROG_TEMPLATES_4 = [
+  { w: 4, v: [1, 5, 6, 4] }, // pop
+  { w: 3, v: [1, 6, 4, 5] }, // pop variant
+  { w: 3, v: [1, 4, 5, 1] }, // classical cadence
+  { w: 2, v: [6, 4, 1, 5] }, // minor-feel start
+  { w: 2, v: [1, 2, 5, 1] }, // ii–V–I
+  { w: 2, v: [1, 3, 6, 2] }, // circle-ish (resolves next phrase)
+];
+
+const CADENCE_ENDINGS = [
+  { w: 5, v: [2, 5, 1, 1] },
+  { w: 4, v: [4, 5, 1, 1] },
+  { w: 3, v: [6, 2, 5, 1] },
+];
+
+// Build a degree plan of length >= measuresNeeded.
+// It creates phrase chunks (4 bars) with a cadence-y ending.
+function buildDegreePlan(measuresNeeded) {
+  const degrees = [];
+  while (degrees.length < measuresNeeded) {
+    const remaining = measuresNeeded - degrees.length;
+    const chunk = remaining >= 4 ? 4 : remaining;
+
+    if (chunk < 4) {
+      // pad with a simple ending
+      for (let i = 0; i < chunk; i++) degrees.push(1);
+      break;
+    }
+
+    // choose either a normal 4-bar template or a cadence ending template
+    const useCadence = degrees.length > 0 && Math.random() < 0.45;
+    const base = useCadence ? weightedChoice(CADENCE_ENDINGS) : weightedChoice(PROG_TEMPLATES_4);
+
+    degrees.push(...base);
+  }
+  return degrees;
+}
+
+// Build 1–2 harmony slots inside a measure for extra musical motion.
+function harmonySlotsForMeasure(measureTicks, degreeThis, degreeNext, difficulty) {
+  const slots = [{ tick: 0, deg: degreeThis, seventh: false }];
+
+  // Add a mid-measure passing harmony more often on medium/hard
+  const allowTwo = difficulty !== "easy" && Math.random() < (difficulty === "hard" ? 0.55 : 0.35);
+  if (allowTwo) {
+    const mid = Math.floor(measureTicks / 2); // 8 in 4/4, 6 in 3/4 or 6/8
+    // passing choices: ii or V toward the next, or IV as a plagal motion
+    const passDeg = weightedChoice([
+      { w: 4, v: 5 }, // dominant
+      { w: 3, v: 2 }, // predominant
+      { w: 2, v: 4 }, // subdominant
+      { w: 1, v: degreeNext || 5 },
+    ]);
+    slots.push({
+      tick: mid,
+      deg: passDeg,
+      seventh: passDeg === 5 && Math.random() < 0.65,
+    });
+  }
+
+  // mark V as 7th sometimes for color
+  if (degreeThis === 5 && difficulty !== "easy" && Math.random() < 0.45) {
+    slots[0].seventh = true;
+  }
+  return slots.sort((a, b) => a.tick - b.tick);
+}
+
+function chordForOffset(offsetTicks, slots, scalePcs) {
+  let chosen = slots[0];
+  for (const s of slots) {
+    if (s.tick <= offsetTicks) chosen = s;
+  }
+  return chordPcsForDegree(chosen.deg, scalePcs, chosen.seventh);
+}
+
+// --- melodic rules ---
+function chooseMelodyMidi({
+  prevMidi,
+  chordPcs,
+  scalePcs,
+  range,
+  strong,
+  medium,
+  difficulty,
+  contourBias, // -1 down, 0 neutral, +1 up
+}) {
+  const targetBase =
+    prevMidi == null ? Math.round((range[0] + range[1]) / 2) : prevMidi;
+
+  // prefer stepwise motion; allow occasional leaps that resolve
+  const stepWeights = difficulty === "easy"
+    ? [{ w: 8, v: 1 }, { w: 8, v: 2 }, { w: 2, v: 3 }, { w: 1, v: 5 }]
+    : difficulty === "medium"
+    ? [{ w: 7, v: 1 }, { w: 7, v: 2 }, { w: 3, v: 3 }, { w: 2, v: 5 }, { w: 1, v: 7 }]
+    : [{ w: 6, v: 1 }, { w: 6, v: 2 }, { w: 4, v: 3 }, { w: 3, v: 5 }, { w: 2, v: 7 }];
+
+  const step = weightedChoice(stepWeights);
+  const dir =
+    contourBias === 0
+      ? weightedChoice([{ w: 1, v: -1 }, { w: 1, v: 1 }])
+      : (Math.random() < 0.7 ? contourBias : -contourBias);
+
+  let target = targetBase + dir * step;
+
+  // strong beats should land on chord tones more often
+  const pcs = strong ? chordPcs : (medium ? (Math.random() < 0.6 ? chordPcs : scalePcs) : scalePcs);
+
+  const m = nearestMidiInPcs(target, pcs, range);
+  return clampMidiToRange(m, range);
+}
+
+// --- voicing rules ---
+function voiceChordForHand({
+  chordPcs,
+  prevVoicing,
+  range,
+  maxNotes,
+  preferClosed = true,
+}) {
+  const center = prevVoicing?.length
+    ? Math.round(prevVoicing.reduce((s, x) => s + x, 0) / prevVoicing.length)
+    : Math.round((range[0] + range[1]) / 2);
+
+  const desiredCount = clamp(maxNotes, 1, MAX_HAND_NOTES);
+
+  // pick a subset of chord pcs (favor 3rd/7th for color in dense chords)
+  const pcsOrder = chordPcs.slice();
+  const pcsPicked = shuffle(pcsOrder).slice(0, clamp(desiredCount, 1, pcsOrder.length));
+
+  // initial placement near center
+  let notes = pcsPicked.map((pc) => clampMidiToRange(nearestMidiWithPc(center, pc), range));
+
+  // if we want more notes than unique pcs (e.g. triad but asked 4),
+  // double root or fifth (still within span constraints)
+  while (notes.length < desiredCount) {
+    const pc = choice([chordPcs[0], chordPcs[2] ?? chordPcs[0]]);
+    notes.push(clampMidiToRange(nearestMidiWithPc(center + (preferClosed ? 4 : 8), pc), range));
+  }
+
+  notes = finalizeHandNotes(notes, range, MAX_HAND_NOTES, MAX_HAND_SPAN_SEMITONES);
+
+  // if we ended up with 0 (extreme ranges), fallback to one safe note
+  if (!notes.length) {
+    notes = [clampMidiToRange(nearestMidiWithPc(center, chordPcs[0]), range)];
+  }
+
+  // cap to requested maxNotes (and also slider)
+  const hardCap = Math.min(MAX_HAND_NOTES, maxNotes);
+  while (notes.length > hardCap) notes.pop();
+
+  return notes;
+}
+
+// --- hand-style per measure ---
+function pickTrebleStyle(difficulty) {
+  return weightedChoice([
+    { w: difficulty === "easy" ? 7 : 4, v: "melody" },
+    { w: difficulty === "easy" ? 2 : 3, v: "melody+dyads" },
+    { w: difficulty === "easy" ? 1 : 3, v: "arpeggio" },
+    { w: difficulty === "hard" ? 2 : 0.5, v: "melody+chords" },
+  ]);
+}
+
+function pickBassStyle(difficulty) {
+  return weightedChoice([
+    { w: difficulty === "easy" ? 6 : 3, v: "root" },
+    { w: difficulty === "easy" ? 2 : 3, v: "octaves" },
+    { w: difficulty === "easy" ? 2 : 3, v: "broken" },
+    { w: difficulty === "hard" ? 2 : 1, v: "walking" },
+  ]);
+}
+
+function bassMidiForRole(chordPcs, prevMidi, range, roleIndex) {
+  // roleIndex cycles through [root, fifth, third, root] for motion
+  const pcRoot = chordPcs[0];
+  const pcThird = chordPcs[1] ?? chordPcs[0];
+  const pcFifth = chordPcs[2] ?? chordPcs[0];
+  const rolePc = [pcRoot, pcFifth, pcThird, pcRoot][roleIndex % 4];
+
+  const target = prevMidi == null ? Math.round((range[0] + range[1]) / 2) : prevMidi;
+  const m = clampMidiToRange(nearestMidiWithPc(target, rolePc), range);
+  return m;
+}
+
+// ===================== MUSICAL RULE-BASED GENERATOR (REPLACE generatePiece WITH THIS) =====================
+
 function generatePiece(targetCount, { key, maxPoly, difficulty }) {
-  const scale = buildScale(key);
-  const [num, den] = state.timeSig.split("/").map(Number);
-  const beatsPerMeasure = num * (4 / den);
+  const { beatsPerMeasure } = parseTimeSig(state.timeSig);
   const measureTicks = beatsToTicks(beatsPerMeasure);
 
-  const { treble: treblePoolTicks, bass: bassPoolTicks, spice, restChanceTreble, restChanceBass } =
-    durationPoolsForDifficultyTicks(difficulty);
+  const scalePcs = scalePcsForKey(key);
+  const preferSharps = (KEY_INFO[key]?.accidentals || 0) > 0;
+
+  // interpret slider as "max notes per hand"
+  const maxHandNotes = clamp(Math.min(MAX_HAND_NOTES, maxPoly), 1, MAX_HAND_NOTES);
 
   const trebleSeq = [];
   const bassSeq = [];
   const targetsByTick = new Map();
 
-  let treblePrev = 72;
-  let bassPrev = 48;
-
   const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
 
-  let measuresToGenerate = Math.max(1, Math.ceil(targetCount / Math.max(1, measureTicks)));
+  // states for voice-leading / contour
+  let treblePrev = 72;
+  let bassPrev = 48;
+  let treblePrevChord = [];
+  let bassPrevChord = [];
+  let contour = weightedChoice([{ w: 1, v: -1 }, { w: 2, v: 0 }, { w: 1, v: 1 }]); // start bias
+
+  // We generate in measures until targets >= targetCount
+  let measuresPlanned = 8;
+  let degreePlan = buildDegreePlan(measuresPlanned);
+
+  const ensurePlan = (needMeasures) => {
+    while (degreePlan.length < needMeasures) {
+      const extra = buildDegreePlan(8);
+      degreePlan.push(...extra);
+    }
+  };
+
   let globalTick = 0;
   let measureIndex = 0;
 
-  while (measureIndex < measuresToGenerate || targetsByTick.size < targetCount) {
-    const trebleDurTicks = fillMeasureTicks(measureTicks, treblePoolTicks);
-    const bassDurTicks   = fillMeasureTicks(measureTicks, bassPoolTicks);
+  while (targetsByTick.size < targetCount) {
+    ensurePlan(measureIndex + 8);
 
-    let tickInMeasure = 0;
-    for (const ticks of trebleDurTicks) {
-      const startTick = globalTick + tickInMeasure;
-      const beats = ticksToBeats(ticks);
+    const degThis = degreePlan[measureIndex] ?? 1;
+    const degNext = degreePlan[measureIndex + 1] ?? 1;
 
-      const makeRest = Math.random() < restChanceTreble;
-      let midis = [];
-      if (!makeRest) {
-        const chordSize = chooseChordSize(maxPoly, difficulty);
-        const picked = pickChord(treblePrev, [60, 88], scale, spice, chordSize);
-        treblePrev = picked.nextPrev;
-        midis = picked.midis;
+    const slots = harmonySlotsForMeasure(measureTicks, degThis, degNext, difficulty);
+
+    const treblePattern = pickRhythmPatternExact(measureTicks, state.timeSig, "treble", difficulty);
+    const bassPattern   = pickRhythmPatternExact(measureTicks, state.timeSig, "bass", difficulty);
+
+    const trebleStyle = pickTrebleStyle(difficulty);
+    const bassStyle   = pickBassStyle(difficulty);
+
+    // occasional contour flip to make phrases (up then down)
+    if (measureIndex % 4 === 3 && Math.random() < 0.6) contour = -contour || -1;
+
+    // ---- TREBLE (melody/figures) ----
+    {
+      let tickInMeasure = 0;
+      let arpIndex = 0;
+      for (let i = 0; i < treblePattern.length; i++) {
+        const ticks = treblePattern[i];
+        const startTick = globalTick + tickInMeasure;
+        const beats = ticksToBeats(ticks);
+
+        const offset = tickInMeasure;
+        const strong = isStrongOffsetTicks(offset, measureTicks, state.timeSig);
+        const medium = isMediumOffsetTicks(offset, measureTicks, state.timeSig);
+
+        const chordPcs = chordForOffset(offset, slots, scalePcs);
+
+        // rests: rare in treble, more on hard for syncopation
+        const restChance =
+          difficulty === "easy" ? 0.04 :
+          difficulty === "medium" ? 0.06 : 0.10;
+
+        let midis = [];
+
+        if (Math.random() < restChance && !strong) {
+          midis = [];
+        } else if (trebleStyle === "arpeggio") {
+          // arpeggiate chord tones in a compact register
+          const pc = chordPcs[(arpIndex++) % chordPcs.length];
+          const target = treblePrev + (contour === 0 ? 0 : contour * (Math.random() < 0.7 ? 1 : 2));
+          const m = clampMidiToRange(nearestMidiWithPc(target, pc), TREBLE_RANGE);
+          treblePrev = m;
+          midis = [m];
+        } else {
+          // melody note
+          const m = chooseMelodyMidi({
+            prevMidi: treblePrev,
+            chordPcs,
+            scalePcs,
+            range: TREBLE_RANGE,
+            strong,
+            medium,
+            difficulty,
+            contourBias: contour,
+          });
+          treblePrev = m;
+
+          if (trebleStyle === "melody+chords" && (strong || (medium && Math.random() < 0.4))) {
+            // small chord hit under the melody (2–4 notes, within 9th span)
+            const want = clamp(weightedChoice([
+              { w: 6, v: 2 },
+              { w: difficulty === "hard" ? 3 : 2, v: 3 },
+              { w: difficulty === "hard" ? 2 : 1, v: 4 },
+            ]), 2, maxHandNotes);
+
+            const chordNotes = voiceChordForHand({
+              chordPcs,
+              prevVoicing: treblePrevChord.length ? treblePrevChord : [m],
+              range: TREBLE_RANGE,
+              maxNotes: want,
+              preferClosed: true,
+            });
+
+            // ensure melody note included
+            chordNotes.push(m);
+
+            midis = finalizeHandNotes(chordNotes, TREBLE_RANGE, maxHandNotes, MAX_HAND_SPAN_SEMITONES);
+            treblePrevChord = midis.slice();
+          } else if (trebleStyle === "melody+dyads" && (strong || Math.random() < 0.35)) {
+            // add one chord tone as a dyad
+            const other = nearestMidiInPcs(m + (Math.random() < 0.5 ? 3 : -3), chordPcs, TREBLE_RANGE);
+            midis = finalizeHandNotes([m, other], TREBLE_RANGE, 2, MAX_HAND_SPAN_SEMITONES);
+            treblePrevChord = midis.slice();
+          } else {
+            midis = [m];
+          }
+        }
+
+        trebleSeq.push({
+          id: `g-${startTick}`,
+          startTick,
+          offsetBeats: ticksToBeats(startTick) + leadInBeats,
+          offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
+          beats,
+          midis,
+        });
+
+        if (midis.length) {
+          let t = targetsByTick.get(startTick);
+          if (!t) {
+            t = {
+              id: `g-${startTick}`,
+              startTick,
+              offsetBeats: ticksToBeats(startTick) + leadInBeats,
+              midis: [],
+              hits: new Set(),
+              mistakeFlag: false,
+              waiting: false,
+              completed: false,
+            };
+            targetsByTick.set(startTick, t);
+          }
+          // merge (dedupe)
+          t.midis = [...new Set([...t.midis, ...midis])].sort((a, b) => a - b);
+        }
+
+        tickInMeasure += ticks;
       }
-
-      trebleSeq.push({
-        id: `g-${startTick}`,
-        startTick,
-        offsetBeats: ticksToBeats(startTick) + leadInBeats,
-        offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
-        beats,
-        midis,
-      });
-
-      if (midis.length) {
-        const target = upsertTarget(targetsByTick, startTick, leadInBeats);
-        addMidisToTarget(target, midis);
-      }
-
-      tickInMeasure += ticks;
     }
 
-    tickInMeasure = 0;
-    for (const ticks of bassDurTicks) {
-      const startTick = globalTick + tickInMeasure;
-      const beats = ticksToBeats(ticks);
+    // ---- BASS (accompaniment) ----
+    {
+      let tickInMeasure = 0;
+      let roleIndex = 0;
 
-      const makeRest = Math.random() < restChanceBass;
-      let midis = [];
-      if (!makeRest) {
-        const chordSize = chooseChordSize(maxPoly, difficulty);
-        const picked = pickChord(bassPrev, [36, 60], scale, spice, chordSize);
-        bassPrev = picked.nextPrev;
-        midis = picked.midis;
+      for (let i = 0; i < bassPattern.length; i++) {
+        const ticks = bassPattern[i];
+        const startTick = globalTick + tickInMeasure;
+        const beats = ticksToBeats(ticks);
+
+        const offset = tickInMeasure;
+        const strong = isStrongOffsetTicks(offset, measureTicks, state.timeSig);
+        const medium = isMediumOffsetTicks(offset, measureTicks, state.timeSig);
+
+        const chordPcs = chordForOffset(offset, slots, scalePcs);
+
+        // rests: bass can rest sometimes, especially on offbeats
+        const restChance =
+          difficulty === "easy" ? 0.02 :
+          difficulty === "medium" ? 0.04 : 0.07;
+
+        let midis = [];
+
+        if (Math.random() < restChance && !strong) {
+          midis = [];
+        } else if (bassStyle === "walking" && difficulty === "hard") {
+          // stepwise-ish bass motion mostly on 8ths/quarters
+          const target = bassPrev + (Math.random() < 0.6 ? (Math.random() < 0.5 ? 1 : -1) : (Math.random() < 0.5 ? 2 : -2));
+          const m = nearestMidiInPcs(target, scalePcs, BASS_RANGE);
+          bassPrev = m;
+          midis = [m];
+        } else if (bassStyle === "octaves" && strong) {
+          const root = bassMidiForRole(chordPcs, bassPrev, BASS_RANGE, 0);
+          bassPrev = root;
+          const octave = clampMidiToRange(root + 12, BASS_RANGE);
+          midis = finalizeHandNotes([root, octave], BASS_RANGE, 2, MAX_HAND_SPAN_SEMITONES);
+          bassPrevChord = midis.slice();
+        } else if (bassStyle === "broken") {
+          // broken chord tones
+          const role = (strong ? 0 : roleIndex++);
+          const m = bassMidiForRole(chordPcs, bassPrev, BASS_RANGE, role);
+          bassPrev = m;
+          // occasionally add a second tone on strong beats
+          if (strong && difficulty !== "easy" && Math.random() < 0.35) {
+            const other = bassMidiForRole(chordPcs, m, BASS_RANGE, 1);
+            midis = finalizeHandNotes([m, other], BASS_RANGE, 2, MAX_HAND_SPAN_SEMITONES);
+            bassPrevChord = midis.slice();
+          } else {
+            midis = [m];
+          }
+        } else {
+          // "root" style: strong = root, otherwise fifth/third
+          const role = strong ? 0 : (medium ? 1 : 2);
+          const m = bassMidiForRole(chordPcs, bassPrev, BASS_RANGE, roleIndex + role);
+          roleIndex++;
+          bassPrev = m;
+
+          // occasionally a compact left-hand chord (2–3 notes) on strong beats
+          if (strong && difficulty !== "easy" && Math.random() < 0.25) {
+            const want = clamp(weightedChoice([
+              { w: 6, v: 2 },
+              { w: difficulty === "hard" ? 3 : 2, v: 3 },
+            ]), 2, Math.min(3, maxHandNotes));
+
+            const chordNotes = voiceChordForHand({
+              chordPcs,
+              prevVoicing: bassPrevChord.length ? bassPrevChord : [m],
+              range: BASS_RANGE,
+              maxNotes: want,
+              preferClosed: true,
+            });
+            // bias low register
+            const centered = chordNotes.map((x) => x <= bassPrev ? x : x - 12);
+            midis = finalizeHandNotes(centered, BASS_RANGE, Math.min(3, maxHandNotes), MAX_HAND_SPAN_SEMITONES);
+            bassPrevChord = midis.slice();
+          } else {
+            midis = [m];
+          }
+        }
+
+        bassSeq.push({
+          id: `g-${startTick}`,
+          startTick,
+          offsetBeats: ticksToBeats(startTick) + leadInBeats,
+          offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
+          beats,
+          midis,
+        });
+
+        if (midis.length) {
+          let t = targetsByTick.get(startTick);
+          if (!t) {
+            t = {
+              id: `g-${startTick}`,
+              startTick,
+              offsetBeats: ticksToBeats(startTick) + leadInBeats,
+              midis: [],
+              hits: new Set(),
+              mistakeFlag: false,
+              waiting: false,
+              completed: false,
+            };
+            targetsByTick.set(startTick, t);
+          }
+          t.midis = [...new Set([...t.midis, ...midis])].sort((a, b) => a - b);
+        }
+
+        tickInMeasure += ticks;
       }
-
-      bassSeq.push({
-        id: `g-${startTick}`,
-        startTick,
-        offsetBeats: ticksToBeats(startTick) + leadInBeats,
-        offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
-        beats,
-        midis,
-      });
-
-      if (midis.length) {
-        const target = upsertTarget(targetsByTick, startTick, leadInBeats);
-        addMidisToTarget(target, midis);
-      }
-
-      tickInMeasure += ticks;
     }
 
     globalTick += measureTicks;
     measureIndex += 1;
 
-    if (measureIndex >= measuresToGenerate && targetsByTick.size < targetCount) {
-      measuresToGenerate += 1;
-    }
+    // safety: if we overshot by a lot, break; targets are already enough
+    if (measureIndex > 64 && targetsByTick.size >= targetCount) break;
   }
 
-  const targets = [...targetsByTick.values()].sort((a, b) => a.startTick - b.startTick);
-  return { trebleSeq, bassSeq, targets, preferSharps: scale.preferSharps };
+  // Trim to exactly the requested number of targets (keep earliest)
+  const targets = [...targetsByTick.values()]
+    .sort((a, b) => a.startTick - b.startTick)
+    .slice(0, targetCount);
+
+  // Also trim trebleSeq/bassSeq to cover at least up through the last target's measure
+  const lastTick = targets.length ? targets[targets.length - 1].startTick : 0;
+  const lastMeasureEnd = (Math.floor(lastTick / measureTicks) + 1) * measureTicks;
+  const keepUntil = lastMeasureEnd;
+
+  const tSeq = trebleSeq.filter((e) => e.startTick < keepUntil);
+  const bSeq = bassSeq.filter((e) => e.startTick < keepUntil);
+
+  return { trebleSeq: tSeq, bassSeq: bSeq, targets, preferSharps };
 }
+
 
 /* ------------------------- VexFlow coloring (setStyle before draw) ------------------------- */
 
