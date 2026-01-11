@@ -235,21 +235,31 @@ function renderSequence(seq, key) {
   const [num, den] = state.timeSig.split("/").map(Number);
   const beatsPerMeasure = num * (4 / den);
   const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
-  const last = seq[seq.length - 1];
+  const beamGroups =
+    VF?.Beam?.getDefaultBeamGroups ? VF.Beam.getDefaultBeamGroups(state.timeSig) : null;
+  const STEM_UP = VF.Stem?.UP ?? 1;
+  const STEM_DOWN = VF.Stem?.DOWN ?? -1;
+
+  // Group events by measure index
+  const measures = [];
+  seq.forEach((ev) => {
+    const idx = Math.floor((ev.offsetBeats - leadInBeats + 1e-6) / beatsPerMeasure);
+    if (!measures[idx]) measures[idx] = { index: idx, events: [] };
+    measures[idx].events.push(ev);
+  });
+
+  const measureWidth = Math.max(200, Math.ceil(beatsPerMeasure * pxPerBeat) + 40);
   const minWidth = scoreWrapper?.clientWidth || 800;
-  const totalWidth = last ? last.offsetPx + 260 : minWidth;
+  const totalWidth = layout.leadInPx + (measures.length + 1) * measureWidth;
   scoreEl.style.width = `${Math.max(totalWidth, minWidth)}px`;
   scoreEl.style.height = "100%";
-  let currentMeasure = -1;
-  let prevMeasureIdx = null;
-  seq.forEach((ev, idx) => {
+
+  measures.forEach((measure) => {
     const group = document.createElement("div");
-    group.className = "note-group";
-    group.dataset.id = ev.id;
     group.style.position = "absolute";
-    group.style.left = `${ev.offsetPx}px`;
+    group.style.left = `${layout.leadInPx + measure.index * measureWidth}px`;
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    const width = 190;
+    const width = measureWidth;
     const height = 260;
     svg.setAttribute("width", width);
     svg.setAttribute("height", height);
@@ -261,79 +271,112 @@ function renderSequence(seq, key) {
     const ctx = renderer.getContext();
     ctx.setFont("Inter", 12, "");
 
-    // measure number overlay
-    const measureIdx = Math.floor((ev.offsetBeats - leadInBeats + 1e-6) / beatsPerMeasure) + 1;
-    const isMeasureStart = prevMeasureIdx === null || measureIdx !== prevMeasureIdx;
-    prevMeasureIdx = measureIdx;
-
     const treble = new VF.Stave(0, 24, width);
     const bass = new VF.Stave(0, 130, width);
-
-    // Only show barlines at measure boundaries
     const barNone = VF.Barline?.type?.NONE ?? VF.Barline.type.NONE;
     const barSingle = VF.Barline?.type?.SINGLE ?? VF.Barline.type.SINGLE;
-    treble.setBegBarType(isMeasureStart ? barSingle : barNone);
+    treble.setBegBarType(barSingle);
     treble.setEndBarType(barNone);
-    bass.setBegBarType(isMeasureStart ? barSingle : barNone);
+    bass.setBegBarType(barSingle);
     bass.setEndBarType(barNone);
-
     treble.setContext(ctx).draw();
     bass.setContext(ctx).draw();
-    if (measureIdx !== currentMeasure) {
-      currentMeasure = measureIdx;
-      const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      txt.setAttribute("x", "4");
-      txt.setAttribute("y", "14");
-      txt.setAttribute("fill", "#9ca3af");
-      txt.setAttribute("font-size", "11");
-      txt.textContent = `M${measureIdx}`;
-      svg.appendChild(txt);
-    }
 
-    const trebleKeys = noteToKeys(ev.midis.filter((m) => m >= 60), state.preferSharps);
-    const bassKeys = noteToKeys(ev.midis.filter((m) => m < 60), state.preferSharps);
+    // measure number
+    const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    txt.setAttribute("x", "4");
+    txt.setAttribute("y", "14");
+    txt.setAttribute("fill", "#9ca3af");
+    txt.setAttribute("font-size", "11");
+    txt.textContent = `M${measure.index + 1}`;
+    svg.appendChild(txt);
 
-    const tDur = beatsToDuration(ev.beats);
-    const bDur = tDur; // same beats for both voices
-    const trebleNote = trebleKeys.length
-      ? new VF.StaveNote({ clef: "treble", keys: trebleKeys.map((k) => k.key), duration: tDur.dur })
-      : new VF.StaveNote({ clef: "treble", keys: ["b/4"], duration: `${tDur.dur}r` });
-    const bassNote = bassKeys.length
-      ? new VF.StaveNote({ clef: "bass", keys: bassKeys.map((k) => k.key), duration: bDur.dur })
-      : new VF.StaveNote({ clef: "bass", keys: ["d/3"], duration: `${bDur.dur}r` });
-    for (let i = 0; i < tDur.dots; i++) VF.Dot.buildAndAttach([trebleNote]);
-    for (let i = 0; i < bDur.dots; i++) VF.Dot.buildAndAttach([bassNote]);
-
+    const trebleNotes = [];
+    const bassNotes = [];
     const keySig = state.keySig;
-    trebleKeys.forEach((k, idx) => {
-      const letter = k.key[0].toUpperCase();
-      if (k.accidental && keySig.get(letter) !== k.accidental) {
-        trebleNote.addModifier(new VF.Accidental(k.accidental), idx);
+
+    measure.events.forEach((ev) => {
+      const trebleKeys = noteToKeys(ev.midis.filter((m) => m >= 60), state.preferSharps);
+      const bassKeys = noteToKeys(ev.midis.filter((m) => m < 60), state.preferSharps);
+      const dur = beatsToDuration(ev.beats);
+
+      const tNote = trebleKeys.length
+        ? new VF.StaveNote({ clef: "treble", keys: trebleKeys.map((k) => k.key), duration: dur.dur, stem_direction: STEM_UP })
+        : new VF.StaveNote({ clef: "treble", keys: ["b/4"], duration: `${dur.dur}r`, stem_direction: STEM_UP });
+      const bNote = bassKeys.length
+        ? new VF.StaveNote({ clef: "bass", keys: bassKeys.map((k) => k.key), duration: dur.dur, stem_direction: STEM_DOWN })
+        : new VF.StaveNote({ clef: "bass", keys: ["d/3"], duration: `${dur.dur}r`, stem_direction: STEM_DOWN });
+
+      for (let i = 0; i < dur.dots; i++) {
+        VF.Dot.buildAndAttach([tNote]);
+        VF.Dot.buildAndAttach([bNote]);
       }
-    });
-    bassKeys.forEach((k, idx) => {
-      const letter = k.key[0].toUpperCase();
-      if (k.accidental && keySig.get(letter) !== k.accidental) {
-        bassNote.addModifier(new VF.Accidental(k.accidental), idx);
-      }
+
+      trebleKeys.forEach((k, idx) => {
+        const letter = k.key[0].toUpperCase();
+        if (k.accidental && keySig.get(letter) !== k.accidental) {
+          tNote.addModifier(new VF.Accidental(k.accidental), idx);
+        }
+      });
+      bassKeys.forEach((k, idx) => {
+        const letter = k.key[0].toUpperCase();
+        if (k.accidental && keySig.get(letter) !== k.accidental) {
+          bNote.addModifier(new VF.Accidental(k.accidental), idx);
+        }
+      });
+
+      trebleNotes.push({ note: tNote, ev });
+      bassNotes.push({ note: bNote, ev });
     });
 
     const trebleVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(false);
-    trebleVoice.addTickables([trebleNote]);
-    new VF.Formatter().joinVoices([trebleVoice]).format([trebleVoice], width - 60);
-    trebleVoice.draw(ctx, treble);
-
+    trebleVoice.addTickables(trebleNotes.map((n) => n.note));
     const bassVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(false);
-    bassVoice.addTickables([bassNote]);
-    new VF.Formatter().joinVoices([bassVoice]).format([bassVoice], width - 60);
+    bassVoice.addTickables(bassNotes.map((n) => n.note));
+
+    const formatter = new VF.Formatter();
+    formatter.joinVoices([trebleVoice]).format([trebleVoice], width - 40);
+    formatter.joinVoices([bassVoice]).format([bassVoice], width - 40);
+
+    let trebleBeams = [];
+    let bassBeams = [];
+    if (VF.Beam?.generateBeams) {
+      trebleBeams = VF.Beam.generateBeams(trebleVoice.getTickables(), {
+        groups: beamGroups || undefined,
+        stem_direction: STEM_UP,
+        beam_rests: false,
+        beam_middle_only: false,
+        maintain_stem_directions: true,
+      });
+      bassBeams = VF.Beam.generateBeams(bassVoice.getTickables(), {
+        groups: beamGroups || undefined,
+        stem_direction: STEM_DOWN,
+        beam_rests: false,
+        beam_middle_only: false,
+        maintain_stem_directions: true,
+      });
+    }
+
+    // Draw voices first (flags suppressed on beamed notes), then beams on top
+    trebleVoice.draw(ctx, treble);
     bassVoice.draw(ctx, bass);
-
-    // Beams for grouped 8ths/16ths (per stave)
-    const trebleBeams = VF.Beam?.generateBeams ? VF.Beam.generateBeams(trebleVoice.getTickables()) : [];
     trebleBeams.forEach((b) => b.setContext(ctx).draw());
-
-    const bassBeams = VF.Beam?.generateBeams ? VF.Beam.generateBeams(bassVoice.getTickables()) : [];
     bassBeams.forEach((b) => b.setContext(ctx).draw());
+
+    trebleNotes.forEach(({ note, ev }) => {
+      const el = note.attrs?.el;
+      if (el) {
+        el.dataset.id = ev.id;
+        el.classList.add("note-group");
+      }
+    });
+    bassNotes.forEach(({ note, ev }) => {
+      const el = note.attrs?.el;
+      if (el) {
+        el.dataset.id = ev.id;
+        el.classList.add("note-group");
+      }
+    });
   });
 }
 
