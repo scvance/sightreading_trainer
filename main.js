@@ -29,6 +29,7 @@ const bpmValue = document.getElementById("bpm-value");
 const keySelect = document.getElementById("key-select");
 const windowSizeInput = document.getElementById("window-size");
 const polyphonyInput = document.getElementById("polyphony");
+const timeSigSelect = document.getElementById("timesig");
 const trickyList = document.getElementById("tricky-list");
 const correctCountEl = document.getElementById("correct-count");
 const mistakeCountEl = document.getElementById("mistake-count");
@@ -49,6 +50,7 @@ let state = {
   key: "C",
   windowSize: Number(windowSizeInput.value),
   maxPoly: Number(polyphonyInput.value),
+  timeSig: "4/4",
   difficulty: "easy",
   running: true,
   sequence: [],
@@ -196,11 +198,15 @@ function noteToKeys(midis, preferSharps) {
 function renderSequence(seq, key) {
   if (!VF) return;
   scoreEl.innerHTML = "";
+  const [num, den] = state.timeSig.split("/").map(Number);
+  const beatsPerMeasure = num * (4 / den);
+  const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
   const last = seq[seq.length - 1];
   const minWidth = scoreWrapper?.clientWidth || 800;
   const totalWidth = last ? last.offsetPx + 260 : minWidth;
   scoreEl.style.width = `${Math.max(totalWidth, minWidth)}px`;
   scoreEl.style.height = "100%";
+  let currentMeasure = -1;
   seq.forEach((ev, idx) => {
     const group = document.createElement("div");
     group.className = "note-group";
@@ -224,6 +230,19 @@ function renderSequence(seq, key) {
     const bass = new VF.Stave(0, 130, width);
     treble.setContext(ctx).draw();
     bass.setContext(ctx).draw();
+
+    // measure number overlay
+    const measureIdx = Math.floor((ev.offsetBeats - leadInBeats + 1e-6) / beatsPerMeasure) + 1;
+    if (measureIdx !== currentMeasure) {
+      currentMeasure = measureIdx;
+      const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      txt.setAttribute("x", "4");
+      txt.setAttribute("y", "14");
+      txt.setAttribute("fill", "#9ca3af");
+      txt.setAttribute("font-size", "11");
+      txt.textContent = `M${measureIdx}`;
+      svg.appendChild(txt);
+    }
 
     const trebleKeys = noteToKeys(ev.midis.filter((m) => m >= 60), state.preferSharps);
     const bassKeys = noteToKeys(ev.midis.filter((m) => m < 60), state.preferSharps);
@@ -249,12 +268,12 @@ function renderSequence(seq, key) {
       }
     });
 
-    const trebleVoice = new VF.Voice({ num_beats: 4, beat_value: 4 }).setStrict(false);
+    const trebleVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(false);
     trebleVoice.addTickables([trebleNote]);
     new VF.Formatter().joinVoices([trebleVoice]).format([trebleVoice], width - 60);
     trebleVoice.draw(ctx, treble);
 
-    const bassVoice = new VF.Voice({ num_beats: 4, beat_value: 4 }).setStrict(false);
+    const bassVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(false);
     bassVoice.addTickables([bassNote]);
     new VF.Formatter().joinVoices([bassVoice]).format([bassVoice], width - 60);
     bassVoice.draw(ctx, bass);
@@ -277,11 +296,11 @@ function renderStaticClefs(key) {
   ctx.setFont("Inter", 12, "");
 
   const treble = new VF.Stave(0, 24, width);
-  treble.addClef("treble").addKeySignature(key);
+  treble.addClef("treble").addKeySignature(key).addTimeSignature(state.timeSig);
   treble.setContext(ctx).draw();
 
   const bass = new VF.Stave(0, 130, width);
-  bass.addClef("bass").addKeySignature(key);
+  bass.addClef("bass").addKeySignature(key).addTimeSignature(state.timeSig);
   bass.setContext(ctx).draw();
 
 }
@@ -531,6 +550,12 @@ function bindControls() {
     regenerate();
   });
 
+  timeSigSelect.addEventListener("change", () => {
+    state.timeSig = timeSigSelect.value;
+    renderStaticClefs(state.key);
+    regenerate();
+  });
+
   midiSelect.addEventListener("change", () => {
     connectMidiInput(midiSelect.value);
   });
@@ -571,6 +596,7 @@ async function init() {
   refreshLayout();
   initKeySelect();
   bindControls();
+  timeSigSelect.value = state.timeSig;
   const ok = await ensureVexFlow();
   if (ok) {
     regenerate();
