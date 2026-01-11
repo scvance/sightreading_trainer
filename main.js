@@ -1,9 +1,7 @@
-/* Sight-reading generator: independent RH/LH rhythms + exact measure filling + reliable red/green note coloring.
-   Key points:
-   - Two independent rhythmic streams per measure (treble/bass).
-   - Tick-perfect generation on a 16th-note grid; each measure fills EXACTLY (notes+rests).
-   - VexFlow STRICT voices (with a small safety-net rest fill for paranoia).
-   - Mistake/correct coloring uses VexFlow StaveNote.setStyle / setKeyStyle BEFORE drawing, then rerenders. :contentReference[oaicite:2]{index=2}
+/* Sight-reading generator: independent RH/LH rhythms + exact measure filling + reliable red/green note coloring
+   + SoundFont playback (real sampled instrument) + Restart Scroll.
+
+   SoundFont playback uses soundfont-player (sampled instruments, not synth sine). :contentReference[oaicite:2]{index=2}
 */
 
 let VF = null;
@@ -77,8 +75,8 @@ let state = {
   keySig: new Map(),
   preferSharps: true,
 
-  // NEW: persistent visual marks per onset id.
-  renderMarks: new Map(), // id -> "mistake" | "correct"
+  // id -> "mistake" | "correct"
+  renderMarks: new Map(),
 };
 
 async function ensureVexFlow() {
@@ -108,6 +106,289 @@ async function ensureVexFlow() {
   });
 }
 
+/* ------------------------- SoundFont playback (sampled instrument) ------------------------- */
+
+const playback = {
+  ctx: null,
+  sf: null, // soundfont function
+  instrument: null,
+  instrumentName: "acoustic_grand_piano",
+  isPlaying: false,
+  activeNodes: [],
+  stopTimer: null,
+  playBtn: null,
+  restartBtn: null,
+  instrumentSelect: null,
+  statusEl: null,
+};
+
+function getThemeColor(varName, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  return v || fallback;
+}
+
+function ensureAudioContext() {
+  if (playback.ctx) return playback.ctx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  playback.ctx = new Ctx();
+  return playback.ctx;
+}
+
+async function ensureSoundfontPlayer() {
+  // soundfont-player dist sets window.Soundfont in the UMD browser build. :contentReference[oaicite:2]{index=2}
+  if (playback.sf) return playback.sf;
+
+  const have = () =>
+    (typeof window.Soundfont === "function" || typeof window.Soundfont === "object") &&
+    typeof window.Soundfont?.instrument === "function";
+
+  if (have()) {
+    playback.sf = window.Soundfont;
+    return playback.sf;
+  }
+
+  // Use UNPKG "View Raw" URL (works as a normal <script src="..."> in browsers).
+  const src = "https://unpkg.com/soundfont-player@0.12.0/dist/soundfont-player.min.js";
+
+  await new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (have()) return resolve();
+      existing.addEventListener("load", resolve);
+      existing.addEventListener("error", reject);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+
+  if (!have()) {
+    throw new Error("soundfont-player loaded, but window.Soundfont.instrument is missing");
+  }
+
+  playback.sf = window.Soundfont;
+  return playback.sf;
+}
+
+async function loadInstrument(name) {
+  const ctx = ensureAudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  const Soundfont = await ensureSoundfontPlayer();
+
+  // README usage: Soundfont.instrument(ac, 'clavinet', { soundfont: 'FluidR3_GM' }) :contentReference[oaicite:3]{index=3}
+  // Default in the library is MusyngKite (higher quality). :contentReference[oaicite:4]{index=4}
+  const inst = await Soundfont.instrument(ctx, name, {
+    soundfont: "MusyngKite",
+    format: "mp3",
+    // Optional perf knob: only decode common piano range (keeps load quick)
+    // notes: Array.from({ length: 61 }, (_, i) => 36 + i), // MIDI 36..96
+  });
+
+  playback.instrument = inst;
+  playback.instrumentName = name;
+
+  return inst;
+}
+
+
+function midiToSoundfontNoteName(midi, preferSharps = true) {
+  const octave = Math.floor(midi / 12) - 1;
+  const names = preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
+  const name = names[midi % 12];
+  return `${name}${octave}`; // e.g., C#4
+}
+
+function playNoteSafe(inst, noteName, whenSec, durSec, gain = 0.75) {
+  try {
+    // Documented form: play(note, time, { duration }) :contentReference[oaicite:6]{index=6}
+    return inst.play(noteName, whenSec, { duration: durSec, gain });
+  } catch (e) {
+    console.warn("instrument.play failed for", noteName, e);
+    return null;
+  }
+}
+
+function stopPlayback() {
+  if (playback.stopTimer) {
+    clearTimeout(playback.stopTimer);
+    playback.stopTimer = null;
+  }
+  playback.activeNodes.forEach((n) => {
+    try {
+      if (n && typeof n.stop === "function") n.stop(0);
+    } catch {}
+  });
+  playback.activeNodes = [];
+  playback.isPlaying = false;
+  if (playback.playBtn) playback.playBtn.textContent = "Play";
+}
+
+function computePlaybackEvents() {
+  // Use per-hand events for realistic independent rhythms.
+  const events = [];
+  const add = (seq) => {
+    seq.forEach((ev) => {
+      if (!ev.midis || ev.midis.length === 0) return; // rests are silent
+      events.push({
+        startBeats: ticksToBeats(ev.startTick),
+        durBeats: ev.beats,
+        midis: ev.midis,
+      });
+    });
+  };
+  add(state.trebleSeq);
+  add(state.bassSeq);
+  events.sort((a, b) => a.startBeats - b.startBeats);
+  return events;
+}
+
+async function startPlaybackFromBeginning() {
+  // Always restart to keep scroll + audio aligned.
+  restartScrollAndExercise(/*preserveStats=*/false);
+
+  if (playback.isPlaying) {
+    stopPlayback();
+    return;
+  }
+
+  const desiredInst = playback.instrumentSelect?.value || playback.instrumentName;
+  if (!playback.instrument || playback.instrumentName !== desiredInst) {
+    await loadInstrument(desiredInst);
+  }
+
+  const inst = playback.instrument;
+  if (!inst) return;
+
+  const ctx = ensureAudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  const secondsPerBeat = 60 / Math.max(1, state.bpm);
+  const baseTime = ctx.currentTime + 0.12;
+
+  // Ensure scroll runs during playback.
+  userPaused = false;
+  if (toggleRunBtn) toggleRunBtn.textContent = "Pause";
+  state.running = true;
+
+  const events = computePlaybackEvents();
+  if (!events.length) {
+    return;
+  }
+
+  // Schedule notes
+  playback.activeNodes = [];
+  events.forEach((ev) => {
+    const when = baseTime + ev.startBeats * secondsPerBeat;
+    // slightly shorten for a cleaner articulation
+    const durSec = Math.max(0.05, ev.durBeats * secondsPerBeat * 0.92);
+
+    ev.midis.forEach((m) => {
+      const nn = midiToSoundfontNoteName(m, state.preferSharps);
+      const node = playNoteSafe(inst, nn, when, durSec, 0.75);
+      if (node) playback.activeNodes.push(node);
+    });
+  });
+
+  const last = events[events.length - 1];
+  const totalDur = (last.startBeats + last.durBeats) * secondsPerBeat + 0.3;
+
+  playback.isPlaying = true;
+  if (playback.playBtn) playback.playBtn.textContent = "Stop";
+
+  playback.stopTimer = setTimeout(() => {
+    stopPlayback();
+  }, Math.ceil(totalDur * 1000));
+}
+
+function ensurePlaybackControlsUI() {
+  if (document.getElementById("playback-controls")) return;
+
+  const parent = regenerateBtn?.parentElement || document.body;
+
+  const wrap = document.createElement("div");
+  wrap.id = "playback-controls";
+  wrap.style.display = "flex";
+  wrap.style.gap = "10px";
+  wrap.style.alignItems = "center";
+  wrap.style.flexWrap = "wrap";
+
+  // Play
+  const playBtn = document.createElement("button");
+  playBtn.id = "play-btn";
+  playBtn.className = "chip";
+  playBtn.textContent = "Play";
+  playBtn.addEventListener("click", () => {
+    startPlaybackFromBeginning().catch((e) => {
+      console.error(e);
+    });
+  });
+
+  // Restart scroll (no audio)
+  const restartBtn = document.createElement("button");
+  restartBtn.id = "restart-scroll";
+  restartBtn.className = "chip";
+  restartBtn.textContent = "Restart Scroll";
+  restartBtn.addEventListener("click", () => {
+    stopPlayback();
+    restartScrollAndExercise(/*preserveStats=*/false);
+  });
+
+  // Instrument select (includes voice-like option)
+  const sel = document.createElement("select");
+  sel.id = "instrument-select";
+  sel.style.padding = "8px 10px";
+  sel.style.borderRadius = "10px";
+  sel.style.border = "1px solid rgba(255,255,255,0.12)";
+  sel.style.background = "rgba(255,255,255,0.06)";
+  sel.style.color = "inherit";
+
+  const options = [
+    { label: "Piano (Acoustic)", value: "acoustic_grand_piano" },
+    { label: "Choir Aahs (Voice-like)", value: "choir_aahs" },
+    { label: "Violin", value: "violin" },
+    { label: "Cello", value: "cello" },
+    { label: "Flute", value: "flute" },
+  ];
+  options.forEach((o) => {
+    const opt = document.createElement("option");
+    opt.value = o.value;
+    opt.textContent = o.label;
+    sel.appendChild(opt);
+  });
+  sel.value = playback.instrumentName;
+  sel.addEventListener("change", () => {
+    // lazy load next time Play is pressed
+    playback.instrument = null;
+  });
+
+  // Status
+  const status = document.createElement("span");
+  status.id = "playback-status";
+  status.textContent = "Audio: ready";
+  status.style.fontSize = "12px";
+  status.style.color = "#9ca3af";
+
+  wrap.appendChild(playBtn);
+  wrap.appendChild(restartBtn);
+  wrap.appendChild(sel);
+  wrap.appendChild(status);
+
+  // Insert near regenerate button
+  parent.insertBefore(wrap, regenerateBtn);
+
+  playback.playBtn = playBtn;
+  playback.restartBtn = restartBtn;
+  playback.instrumentSelect = sel;
+  playback.statusEl = status;
+}
+
+/* ------------------------- UI init ------------------------- */
+
 function initKeySelect() {
   Object.keys(KEY_INFO).forEach((k) => {
     const opt = document.createElement("option");
@@ -118,14 +399,7 @@ function initKeySelect() {
   keySelect.value = state.key;
 }
 
-function midiToVex(midi, preferSharps) {
-  const octave = Math.floor(midi / 12) - 1;
-  const names = preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
-  const name = names[midi % 12];
-  const accidental = name.length > 1 ? name[1] : null;
-  const key = `${name[0].toLowerCase()}${accidental ? accidental.toLowerCase() : ""}/${octave}`;
-  return { key, accidental };
-}
+/* ------------------------- Vex / scoring / generation ------------------------- */
 
 function buildScale(key) {
   const rootName = key.replace("b", "b").replace("#", "#");
@@ -134,16 +408,6 @@ function buildScale(key) {
   const rootIndex = names.findIndex((n) => n === rootName);
   const pcs = new Set(MAJOR_SCALE.map((step) => (rootIndex + step + 12) % 12));
   return { pcs, preferSharps };
-}
-
-function keySignatureAccidentals(key) {
-  const count = KEY_INFO[key]?.accidentals || 0;
-  const sharps = ["F", "C", "G", "D", "A", "E", "B"];
-  const flats = ["B", "E", "A", "D", "G", "C", "F"];
-  const map = new Map();
-  if (count > 0) sharps.slice(0, count).forEach((l) => map.set(l, "#"));
-  else if (count < 0) flats.slice(0, Math.abs(count)).forEach((l) => map.set(l, "b"));
-  return map;
 }
 
 function pickPitch(prev, range, scale, spice = 0.2) {
@@ -165,23 +429,6 @@ function pickPitch(prev, range, scale, spice = 0.2) {
     tries++;
   }
   return Math.min(Math.max(candidate, low), high);
-}
-
-function chooseChordSize(maxPoly, difficulty) {
-  const maxHandPoly = Math.min(maxPoly, difficulty === "hard" ? 4 : 3);
-  if (maxHandPoly <= 1) return 1;
-
-  const r = Math.random();
-  if (difficulty === "easy") return r < 0.15 ? 2 : 1;
-  if (difficulty === "medium") {
-    if (r < 0.25) return 2;
-    if (r < 0.32) return Math.min(3, maxHandPoly);
-    return 1;
-  }
-  if (r < 0.30) return 2;
-  if (r < 0.48) return Math.min(3, maxHandPoly);
-  if (r < 0.56) return Math.min(4, maxHandPoly);
-  return 1;
 }
 
 function pickChord(prev, range, scale, spice, chordSize) {
@@ -207,9 +454,24 @@ function pickChord(prev, range, scale, spice, chordSize) {
   return { midis, nextPrev: root };
 }
 
-/* ------------------------- Tick-perfect rhythm system ------------------------- */
+function chooseChordSize(maxPoly, difficulty) {
+  const maxHandPoly = Math.min(maxPoly, difficulty === "hard" ? 4 : 3);
+  if (maxHandPoly <= 1) return 1;
 
-const TICK = 0.25; // beats per tick (16th grid)
+  const r = Math.random();
+  if (difficulty === "easy") return r < 0.15 ? 2 : 1;
+  if (difficulty === "medium") {
+    if (r < 0.25) return 2;
+    if (r < 0.32) return Math.min(3, maxHandPoly);
+    return 1;
+  }
+  if (r < 0.30) return 2;
+  if (r < 0.48) return Math.min(3, maxHandPoly);
+  if (r < 0.56) return Math.min(4, maxHandPoly);
+  return 1;
+}
+
+const TICK = 0.25; // beats per tick
 const DUR_TICKS = [16, 12, 8, 6, 4, 3, 2, 1];
 
 function beatsToTicks(beats) {
@@ -325,8 +587,8 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
   const bassSeq = [];
   const targetsByTick = new Map();
 
-  let treblePrev = 72; // C5
-  let bassPrev = 48;   // C3
+  let treblePrev = 72;
+  let bassPrev = 48;
 
   const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
 
@@ -336,9 +598,8 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
 
   while (measureIndex < measuresToGenerate || targetsByTick.size < targetCount) {
     const trebleDurTicks = fillMeasureTicks(measureTicks, treblePoolTicks);
-    const bassDurTicks = fillMeasureTicks(measureTicks, bassPoolTicks);
+    const bassDurTicks   = fillMeasureTicks(measureTicks, bassPoolTicks);
 
-    // Treble
     let tickInMeasure = 0;
     for (const ticks of trebleDurTicks) {
       const startTick = globalTick + tickInMeasure;
@@ -370,7 +631,6 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
       tickInMeasure += ticks;
     }
 
-    // Bass
     tickInMeasure = 0;
     for (const ticks of bassDurTicks) {
       const startTick = globalTick + tickInMeasure;
@@ -414,10 +674,46 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
   return { trebleSeq, bassSeq, targets, preferSharps: scale.preferSharps };
 }
 
-/* ------------------------- VexFlow rendering helpers ------------------------- */
+/* ------------------------- VexFlow coloring (setStyle before draw) ------------------------- */
+
+function applyMarkToVfNote(vfNote, id) {
+  const mark = state.renderMarks.get(id);
+  if (!mark) return;
+
+  const color =
+    mark === "mistake"
+      ? getThemeColor("--danger", "#e11d48")
+      : getThemeColor("--success", "#16a34a");
+
+  const style = { fillStyle: color, strokeStyle: color };
+
+  // VexFlow docs: setStyle sets all noteheads + stem; setKeyStyle colors heads individually. :contentReference[oaicite:7]{index=7}
+  if (typeof vfNote.setStyle === "function") vfNote.setStyle(style);
+  if (typeof vfNote.setStemStyle === "function") vfNote.setStemStyle(style);
+  if (typeof vfNote.setFlagStyle === "function") vfNote.setFlagStyle(style);
+  if (typeof vfNote.setKeyStyle === "function" && Array.isArray(vfNote.keys)) {
+    for (let i = 0; i < vfNote.keys.length; i++) vfNote.setKeyStyle(i, style);
+  }
+}
+
+function rerenderPreserveScroll() {
+  const prevTransform = scoreEl.style.transform;
+  renderStaticClefs(state.key);
+  renderSequence(state.trebleSeq, state.bassSeq, state.key);
+  scoreEl.style.transform = prevTransform;
+}
+
+/* ------------------------- Rendering ------------------------- */
 
 function noteToKeys(midis, preferSharps) {
-  return midis.map((m) => midiToVex(m, preferSharps));
+  return midis.map((m) => {
+    const octave = Math.floor(m / 12) - 1;
+    const names = preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
+    const name = names[m % 12];
+    const accidental = name.length > 1 ? name[1] : null;
+    const key = `${name[0].toLowerCase()}${accidental ? accidental.toLowerCase() : ""}/${octave}`;
+    return { key, accidental };
+  });
 }
 
 function splitTicks(remTicks) {
@@ -455,46 +751,9 @@ function makeStaveNote({ clef, keys, dur, dots, stem_direction, isRest }) {
     n = new VF.StaveNote(base);
   }
 
-  // Intrinsic ticks come from dots:; these dots are display only.
   attachDotsForDisplay(n, dots || 0);
   return n;
 }
-
-function getThemeColor(varName, fallback) {
-  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-  return v || fallback;
-}
-
-function applyMarkToVfNote(vfNote, id) {
-  const mark = state.renderMarks.get(id);
-  if (!mark) return;
-
-  const color =
-    mark === "mistake"
-      ? getThemeColor("--danger", "#e11d48")
-      : getThemeColor("--success", "#16a34a");
-
-  const style = { fillStyle: color, strokeStyle: color };
-
-  // Documented APIs for coloring notes. :contentReference[oaicite:3]{index=3}
-  if (typeof vfNote.setStyle === "function") vfNote.setStyle(style);
-  if (typeof vfNote.setStemStyle === "function") vfNote.setStemStyle(style);
-  if (typeof vfNote.setFlagStyle === "function") vfNote.setFlagStyle(style);
-
-  // Ensure each head is colored even if setStyle misses something in your bundled build.
-  if (typeof vfNote.setKeyStyle === "function" && Array.isArray(vfNote.keys)) {
-    for (let i = 0; i < vfNote.keys.length; i++) vfNote.setKeyStyle(i, style);
-  }
-}
-
-function rerenderPreserveScroll() {
-  const prevTransform = scoreEl.style.transform;
-  renderStaticClefs(state.key);
-  renderSequence(state.trebleSeq, state.bassSeq, state.key);
-  scoreEl.style.transform = prevTransform;
-}
-
-/* ------------------------- Render score (measures) ------------------------- */
 
 function renderSequence(trebleSeq, bassSeq, key) {
   if (!VF) return;
@@ -625,7 +884,6 @@ function renderSequence(trebleSeq, bassSeq, key) {
             isRest: true,
           });
 
-      // Apply mark color BEFORE drawing. :contentReference[oaicite:4]{index=4}
       applyMarkToVfNote(note, ev.id);
 
       keys.forEach((k, idx) => {
@@ -674,10 +932,8 @@ function renderSequence(trebleSeq, bassSeq, key) {
       bassNotes.push({ note, ev });
     });
 
-    // STRICT mode throws if incomplete. :contentReference[oaicite:5]{index=5}
     const trebleVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(true);
     trebleVoice.addTickables(trebleNotes.map((n) => n.note));
-
     const bassVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(true);
     bassVoice.addTickables(bassNotes.map((n) => n.note));
 
@@ -710,7 +966,7 @@ function renderSequence(trebleSeq, bassSeq, key) {
     trebleBeams.forEach((b) => b.setContext(ctx).draw());
     bassBeams.forEach((b) => b.setContext(ctx).draw());
 
-    // Optional: tag for "active" CSS class highlighting (not used for red/green).
+    // Optional: tag for "active" CSS (not required for red/green)
     function tagNoteEl(note, ev) {
       const el = note?.attrs?.el;
       if (!el) return;
@@ -747,7 +1003,7 @@ function renderStaticClefs(key) {
   bass.setContext(ctx).draw();
 }
 
-/* ------------------------- Stats + targets ------------------------- */
+/* ------------------------- Stats + grading ------------------------- */
 
 function updateStats() {
   correctCountEl.textContent = state.stats.correct;
@@ -765,8 +1021,10 @@ function updateStats() {
   } else {
     sorted.forEach(([midi, count]) => {
       const li = document.createElement("li");
-      const textKey = midiToVex(midi, state.preferSharps).key.replace("/", "");
-      li.textContent = `${textKey} — ${count} misses`;
+      const octave = Math.floor(midi / 12) - 1;
+      const names = state.preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
+      const name = names[midi % 12];
+      li.textContent = `${name}${octave} — ${count} misses`;
       trickyList.appendChild(li);
     });
   }
@@ -775,8 +1033,6 @@ function updateStats() {
 function currentTarget() {
   return state.targets.find((ev) => !ev.completed);
 }
-
-/* ------------------------- Marking (now triggers rerender) ------------------------- */
 
 function markCorrect(ev) {
   if (ev.completed) return;
@@ -802,6 +1058,7 @@ function markMistake(ev, midi) {
 
   updateStats();
 
+  // Pause at this onset so the next target doesn't instantly flag.
   state.progressBeats = Math.min(state.progressBeats, ev.offsetBeats);
   const translate = -state.progressBeats * pxPerBeat;
   scoreEl.style.transform = `translateX(${translate}px)`;
@@ -821,10 +1078,8 @@ function checkPlayheadMiss() {
 }
 
 function highlightCurrent() {
-  // purely cosmetic, if you have CSS for `.active`
   const groups = scoreEl.querySelectorAll(".note-group");
   groups.forEach((g) => g.classList.remove("active"));
-
   const ev = currentTarget();
   if (!ev) return;
 
@@ -861,7 +1116,6 @@ function connectMidiInput(id) {
   state.midiInputId = id;
   state.midiInputs.forEach((inp) => (inp.onmidimessage = null));
   let target = null;
-
   if (!id || id === "auto") target = state.midiInputs[0];
   else target = state.midiInputs.find((i) => i.id === id);
 
@@ -900,7 +1154,6 @@ function refreshMidiInputs(access) {
       : "auto";
 
   connectMidiInput(midiSelect.value);
-  console.info("MIDI inputs detected:", state.midiInputs.map((i) => i.name));
 }
 
 async function initMIDI() {
@@ -926,19 +1179,14 @@ async function initMIDI() {
     if (!state.midiInputs.length) {
       midiStatusEl.textContent = "MIDI: no devices detected";
       midiStatusEl.classList.add("warn");
-      console.warn(
-        "No MIDI devices detected. If using Chrome, check chrome://settings/content/midiDevices and ensure access is allowed."
-      );
     }
   } catch (e) {
-    if (e && e.name === "NotAllowedError") midiStatusEl.textContent = "MIDI blocked: allow in site settings/padlock";
-    else midiStatusEl.textContent = "MIDI: permission denied";
+    midiStatusEl.textContent = "MIDI: permission denied";
     midiStatusEl.classList.add("warn");
-    console.error("MIDI access error:", e);
   }
 }
 
-/* ------------------------- Main loop / controls ------------------------- */
+/* ------------------------- Clock / scroll ------------------------- */
 
 let lastFrame = performance.now();
 let userPaused = false;
@@ -953,7 +1201,6 @@ function refreshLayout() {
 function tick(now) {
   const delta = (now - lastFrame) / 1000;
   lastFrame = now;
-
   if (state.running && !userPaused) {
     state.progressBeats += (state.bpm / 60) * delta;
     const translate = -state.progressBeats * pxPerBeat;
@@ -961,9 +1208,54 @@ function tick(now) {
     checkPlayheadMiss();
     highlightCurrent();
   }
-
   requestAnimationFrame(tick);
 }
+
+/* ------------------------- Restart scroll / replay ------------------------- */
+
+function restartScrollAndExercise(preserveStats = false) {
+  state.progressBeats = 0;
+  scoreEl.style.transform = `translateX(0px)`;
+  lastFrame = performance.now();
+
+  state.targets.forEach((t) => {
+    t.completed = false;
+    t.waiting = false;
+    t.mistakeFlag = false;
+    t.hits = new Set();
+  });
+
+  if (!preserveStats) {
+    state.stats = { correct: 0, mistakes: 0 };
+    state.tricky = new Map();
+    updateStats();
+  }
+
+  state.renderMarks = new Map();
+  renderStaticClefs(state.key);
+  renderSequence(state.trebleSeq, state.bassSeq, state.key);
+
+  state.running = true;
+  userPaused = false;
+  if (toggleRunBtn) toggleRunBtn.textContent = "Pause";
+}
+
+/* ------------------------- Regenerate ------------------------- */
+
+function keySignatureAccidentals(key) {
+  const count = KEY_INFO[key]?.accidentals || 0;
+  const sharps = ["F", "C", "G", "D", "A", "E", "B"];
+  const flats  = ["B", "E", "A", "D", "G", "C", "F"];
+
+  const map = new Map();
+  if (count > 0) {
+    sharps.slice(0, count).forEach((l) => map.set(l, "#"));
+  } else if (count < 0) {
+    flats.slice(0, Math.abs(count)).forEach((l) => map.set(l, "b"));
+  }
+  return map;
+}
+
 
 function regenerate() {
   if (!VF) return;
@@ -997,6 +1289,8 @@ function regenerate() {
   state.running = true;
 }
 
+/* ------------------------- Controls ------------------------- */
+
 function bindControls() {
   bpmRange.addEventListener("input", () => {
     state.bpm = Number(bpmRange.value);
@@ -1010,7 +1304,7 @@ function bindControls() {
   });
 
   windowSizeInput.addEventListener("change", () => {
-    state.windowSize = Math.min(32, Math.max(4, Number(windowSizeInput.value)));
+    state.windowSize = Math.min(256, Math.max(4, Number(windowSizeInput.value))); // allow longer if you want
     windowSizeInput.value = state.windowSize;
     regenerate();
   });
@@ -1031,7 +1325,10 @@ function bindControls() {
     connectMidiInput(midiSelect.value);
   });
 
-  regenerateBtn.addEventListener("click", regenerate);
+  regenerateBtn.addEventListener("click", () => {
+    stopPlayback();
+    regenerate();
+  });
 
   toggleRunBtn.addEventListener("click", () => {
     userPaused = !userPaused;
@@ -1044,6 +1341,7 @@ function bindControls() {
       diffButtons.forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       state.difficulty = btn.dataset.diff;
+      stopPlayback();
       regenerate();
     });
   });
@@ -1066,6 +1364,7 @@ function startClock() {
 async function init() {
   refreshLayout();
   initKeySelect();
+  ensurePlaybackControlsUI();
   bindControls();
   timeSigSelect.value = state.timeSig;
 
