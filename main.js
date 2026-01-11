@@ -160,7 +160,12 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
   let bassPrev = 48; // C3
   const [num, den] = state.timeSig.split("/").map(Number);
   const beatsPerMeasure = num * (4 / den);
-  const durPool = difficulty === "hard" ? [0.5, 0.5, 1, 1, 1.5, 2] : difficulty === "medium" ? [0.5, 1, 1, 1, 2] : [1, 1, 1, 2];
+  const durPool =
+    difficulty === "hard"
+      ? [0.25, 0.25, 0.5, 0.5, 0.5, 1, 1, 1.5, 2]
+      : difficulty === "medium"
+      ? [0.5, 0.5, 1, 1, 1, 1.5, 2]
+      : [0.5, 1, 1, 1, 1, 2];
   const spice = difficulty === "hard" ? 0.45 : difficulty === "medium" ? 0.3 : 0.18;
   let measureBeat = 0;
 
@@ -179,6 +184,8 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
     }
     const uniqueMidis = [...new Set(midis)].sort((a, b) => a - b);
     let beats = durPool[Math.floor(Math.random() * durPool.length)];
+    // Allow dotted quarters (1.5) occasionally in easy/medium as well
+    if (difficulty !== "hard" && Math.random() < 0.1) beats = 1.5;
     const remaining = beatsPerMeasure - measureBeat;
     if (beats > remaining + 1e-6) {
       if (remaining >= 0.5) {
@@ -209,6 +216,17 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
 
 function noteToKeys(midis, preferSharps) {
   return midis.map((m) => midiToVex(m, preferSharps));
+}
+
+function beatsToDuration(beats) {
+  const snapped = Math.round(beats / 0.25) * 0.25;
+  const b = Math.max(0.25, snapped);
+  if (Math.abs(b - 2) < 1e-3) return { dur: "h", dots: 0 };
+  if (Math.abs(b - 1.5) < 1e-3) return { dur: "q", dots: 1 };
+  if (Math.abs(b - 1) < 1e-3) return { dur: "q", dots: 0 };
+  if (Math.abs(b - 0.5) < 1e-3) return { dur: "8", dots: 0 };
+  if (Math.abs(b - 0.25) < 1e-3) return { dur: "16", dots: 0 };
+  return { dur: "q", dots: 0 };
 }
 
 function renderSequence(seq, key) {
@@ -275,12 +293,16 @@ function renderSequence(seq, key) {
     const trebleKeys = noteToKeys(ev.midis.filter((m) => m >= 60), state.preferSharps);
     const bassKeys = noteToKeys(ev.midis.filter((m) => m < 60), state.preferSharps);
 
+    const tDur = beatsToDuration(ev.beats);
+    const bDur = tDur; // same beats for both voices
     const trebleNote = trebleKeys.length
-      ? new VF.StaveNote({ clef: "treble", keys: trebleKeys.map((k) => k.key), duration: ev.vex })
-      : new VF.StaveNote({ clef: "treble", keys: ["b/4"], duration: `${ev.vex}r` });
+      ? new VF.StaveNote({ clef: "treble", keys: trebleKeys.map((k) => k.key), duration: tDur.dur })
+      : new VF.StaveNote({ clef: "treble", keys: ["b/4"], duration: `${tDur.dur}r` });
     const bassNote = bassKeys.length
-      ? new VF.StaveNote({ clef: "bass", keys: bassKeys.map((k) => k.key), duration: ev.vex })
-      : new VF.StaveNote({ clef: "bass", keys: ["d/3"], duration: `${ev.vex}r` });
+      ? new VF.StaveNote({ clef: "bass", keys: bassKeys.map((k) => k.key), duration: bDur.dur })
+      : new VF.StaveNote({ clef: "bass", keys: ["d/3"], duration: `${bDur.dur}r` });
+    for (let i = 0; i < tDur.dots; i++) VF.Dot.buildAndAttach([trebleNote]);
+    for (let i = 0; i < bDur.dots; i++) VF.Dot.buildAndAttach([bassNote]);
 
     const keySig = state.keySig;
     trebleKeys.forEach((k, idx) => {
@@ -305,6 +327,13 @@ function renderSequence(seq, key) {
     bassVoice.addTickables([bassNote]);
     new VF.Formatter().joinVoices([bassVoice]).format([bassVoice], width - 60);
     bassVoice.draw(ctx, bass);
+
+    // Beams for grouped 8ths/16ths (per stave)
+    const trebleBeams = VF.Beam?.generateBeams ? VF.Beam.generateBeams(trebleVoice.getTickables()) : [];
+    trebleBeams.forEach((b) => b.setContext(ctx).draw());
+
+    const bassBeams = VF.Beam?.generateBeams ? VF.Beam.generateBeams(bassVoice.getTickables()) : [];
+    bassBeams.forEach((b) => b.setContext(ctx).draw());
   });
 }
 
