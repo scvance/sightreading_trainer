@@ -1,0 +1,71 @@
+:root {
+  --bg: #f1f4f9;
+  --panel: #ffffff;
+  --accent: #0066ff;
+  --accent-2: #00d8ff;
+  --text: #111827;
+  --muted: #6b7280;
+  --danger: #e11d48;
+  --success: #16a34a;
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; }
+
+.app { max-width: 1200px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+header { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+header h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+header p { margin: 4px 0 0; color: var(--muted); }
+.status { display: flex; gap: 8px; align-items: center; }
+
+.pill { padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); color: var(--text); font-size: 12px; }
+.pill.warn { color: #facc15; }
+
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; background: var(--panel); padding: 14px; border-radius: 12px; box-shadow: var(--shadow); align-items: center; }
+.control { display: flex; flex-direction: column; gap: 6px; color: var(--muted); }
+.control label { font-weight: 600; color: var(--text); }
+.control input[type="number"], .control select { padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); color: var(--text); }
+.control input[type="range"] { accent-color: var(--accent); }
+.control button { padding: 10px 12px; border-radius: 10px; border: none; cursor: pointer; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #0b1020; font-weight: 700; }
+.control button#toggle-run { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid rgba(255,255,255,0.08); }
+
+.chips { display: flex; gap: 6px; }
+.chip { padding: 8px 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: var(--text); cursor: pointer; }
+.chip.active { border-color: var(--accent); color: #0b1020; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+
+main { display: grid; grid-template-columns: 2fr 320px; gap: 16px; align-items: start; }
+.score-wrapper { position: relative; background: #fffef8; border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); height: 320px; border: 1px solid #e5e7eb; }
+.score { position: absolute; inset: 0; display: flex; align-items: flex-start; gap: 12px; padding: 16px 16px 16px 0; background: linear-gradient(90deg, #fffef8 60%, rgba(255,255,255,0)); }
+.playhead { position: absolute; top: 0; bottom: 0; width: 2px; left: 120px; background: var(--accent); box-shadow: 0 0 0 6px rgba(0, 102, 255, 0.15); z-index: 2; }
+.static-clefs { position: absolute; left: 0; top: 0; bottom: 0; width: 120px; background: #fffef8; border-right: 1px solid #e5e7eb; padding: 16px 8px; display: flex; align-items: flex-start; justify-content: center; z-index: 1; pointer-events: none; }
+.placeholder { color: var(--muted); padding: 24px; font-style: italic; }
+
+.sidebar { display: flex; flex-direction: column; gap: 12px; }
+.card { background: var(--panel); border-radius: 12px; padding: 14px; box-shadow: var(--shadow); }
+.card h3 { margin: 0 0 8px; }
+.stat { display: flex; justify-content: space-between; margin: 6px 0; color: var(--muted); }
+.stat strong { color: var(--text); }
+.help { padding-left: 16px; margin: 0; color: var(--muted); display: grid; gap: 6px; }
+
+.note-group { position: relative; }
+.note-group.mistake { animation: shake 0.4s ease; }
+.note-group .vf-stavenote path { transition: fill 0.2s; }
+.note-group.correct .vf-stavenote path { fill: var(--success); }
+.note-group.mistake .vf-stavenote path { fill: var(--danger); }
+
+@keyframes shake {
+  0% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  50% { transform: translateX(4px); }
+  75% { transform: translateX(-3px); }
+  100% { transform: translateX(0); }
+}
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  .score-wrapper { height: 280px; }
+}

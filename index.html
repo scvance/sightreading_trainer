@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Piano Sight Reading Helper</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="./vendor-vexflow.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>Realtime Sight Reading Coach</h1>
+        <p>Connect a MIDI keyboard and follow the scrolling score. Mistakes pause the scroll until corrected.</p>
+      </div>
+      <div class="status">
+        <span id="midi-status" class="pill warn">MIDI: Not connected</span>
+        <span id="clock" class="pill">--:--</span>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="control">
+        <label for="key-select">Key signature</label>
+        <select id="key-select"></select>
+      </div>
+      <div class="control">
+        <label for="bpm-range">Tempo (BPM)</label>
+        <input type="range" id="bpm-range" min="40" max="200" step="2" value="96" />
+        <span id="bpm-value">96</span>
+      </div>
+      <div class="control">
+        <label for="window-size">Notes ahead (1-32)</label>
+        <input type="number" id="window-size" min="4" max="32" value="12" />
+      </div>
+      <div class="control">
+        <label for="polyphony">Max simultaneous notes (1-10)</label>
+        <input type="number" id="polyphony" min="1" max="10" value="3" />
+      </div>
+      <div class="control">
+        <label for="midi-select">MIDI input</label>
+        <select id="midi-select"></select>
+      </div>
+      <div class="control">
+        <label>&nbsp;</label>
+        <button id="midi-connect">Connect MIDI</button>
+      </div>
+      <div class="control">
+        <label>Difficulty</label>
+        <div class="chips" id="difficulty">
+          <button data-diff="easy" class="chip active">Easy</button>
+          <button data-diff="medium" class="chip">Medium</button>
+          <button data-diff="hard" class="chip">Hard</button>
+        </div>
+      </div>
+      <div class="control">
+        <button id="regenerate">Regenerate</button>
+        <button id="toggle-run">Pause</button>
+      </div>
+    </section>
+
+    <main>
+      <div class="score-wrapper">
+        <div id="static-clefs" class="static-clefs"></div>
+        <div class="playhead"></div>
+        <div id="score" class="score"></div>
+      </div>
+      <aside class="sidebar">
+        <div class="card">
+          <h3>Performance</h3>
+          <div class="stat"><span>Correct</span><strong id="correct-count">0</strong></div>
+          <div class="stat"><span>Mistakes</span><strong id="mistake-count">0</strong></div>
+          <div class="stat"><span>Accuracy</span><strong id="accuracy">0%</strong></div>
+        </div>
+        <div class="card">
+          <h3>Tricky notes</h3>
+          <ul id="tricky-list"></ul>
+        </div>
+        <div class="card">
+          <h3>Help</h3>
+          <ul class="help">
+            <li>Press any key on your MIDI keyboard to initialize input.</li>
+            <li>Mistakes shake red; scroll pauses until the right pitch is played.</li>
+            <li>Use Regenerate to get fresh material without reloading.</li>
+          </ul>
+        </div>
+      </aside>
+    </main>
+  </div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
