@@ -1,11 +1,9 @@
-/* Sight-reading generator w/ independent RH/LH rhythms + exact measure filling (notes+rests).
-   Key design:
-   - Generate per-hand sequences using integer ticks on a 16th-note grid.
-   - Only emit durations that map cleanly to VexFlow durations + dots.
-   - Render treble & bass as independent voices; STRICT mode enforces exact measure fill. :contentReference[oaicite:4]{index=4}
-   - IMPORTANT: In some VexFlow builds, Dot modifiers DO NOT affect intrinsic ticks (strict will throw).
-     So we set `dots:` in the StaveNote constructor for correct duration ticks, and use Dot modifiers only
-     for drawing the dot glyph. :contentReference[oaicite:5]{index=5}
+/* Sight-reading generator: independent RH/LH rhythms + exact measure filling + reliable red/green note coloring.
+   Key points:
+   - Two independent rhythmic streams per measure (treble/bass).
+   - Tick-perfect generation on a 16th-note grid; each measure fills EXACTLY (notes+rests).
+   - VexFlow STRICT voices (with a small safety-net rest fill for paranoia).
+   - Mistake/correct coloring uses VexFlow StaveNote.setStyle / setKeyStyle BEFORE drawing, then rerenders. :contentReference[oaicite:2]{index=2}
 */
 
 let VF = null;
@@ -78,6 +76,9 @@ let state = {
 
   keySig: new Map(),
   preferSharps: true,
+
+  // NEW: persistent visual marks per onset id.
+  renderMarks: new Map(), // id -> "mistake" | "correct"
 };
 
 async function ensureVexFlow() {
@@ -140,11 +141,8 @@ function keySignatureAccidentals(key) {
   const sharps = ["F", "C", "G", "D", "A", "E", "B"];
   const flats = ["B", "E", "A", "D", "G", "C", "F"];
   const map = new Map();
-  if (count > 0) {
-    sharps.slice(0, count).forEach((l) => map.set(l, "#"));
-  } else if (count < 0) {
-    flats.slice(0, Math.abs(count)).forEach((l) => map.set(l, "b"));
-  }
+  if (count > 0) sharps.slice(0, count).forEach((l) => map.set(l, "#"));
+  else if (count < 0) flats.slice(0, Math.abs(count)).forEach((l) => map.set(l, "b"));
   return map;
 }
 
@@ -157,7 +155,6 @@ function pickPitch(prev, range, scale, spice = 0.2) {
   const useLeap = Math.random() < spice;
   const pool = useLeap ? leapChoices : stepChoices;
   candidate += pool[Math.floor(Math.random() * pool.length)];
-
   if (candidate < low || candidate > high) candidate = prev;
 
   let tries = 0;
@@ -175,9 +172,7 @@ function chooseChordSize(maxPoly, difficulty) {
   if (maxHandPoly <= 1) return 1;
 
   const r = Math.random();
-  if (difficulty === "easy") {
-    return r < 0.15 ? 2 : 1;
-  }
+  if (difficulty === "easy") return r < 0.15 ? 2 : 1;
   if (difficulty === "medium") {
     if (r < 0.25) return 2;
     if (r < 0.32) return Math.min(3, maxHandPoly);
@@ -192,8 +187,8 @@ function chooseChordSize(maxPoly, difficulty) {
 function pickChord(prev, range, scale, spice, chordSize) {
   const root = pickPitch(prev, range, scale, spice);
   const notes = [root];
-
   const intervals = [3, 4, 7, 10, 12];
+
   for (let i = 1; i < chordSize; i++) {
     const intv = intervals[Math.floor(Math.random() * intervals.length)];
     let n = root + (Math.random() < 0.5 ? -intv : intv);
@@ -214,9 +209,7 @@ function pickChord(prev, range, scale, spice, chordSize) {
 
 /* ------------------------- Tick-perfect rhythm system ------------------------- */
 
-const TICK = 0.25; // beats per tick (16th-note grid)
-
-// Tick counts that map cleanly to base duration + dot count.
+const TICK = 0.25; // beats per tick (16th grid)
 const DUR_TICKS = [16, 12, 8, 6, 4, 3, 2, 1];
 
 function beatsToTicks(beats) {
@@ -254,13 +247,10 @@ function durationPoolsForDifficultyTicks(difficulty) {
   };
 }
 
-/**
- * Fill exactly measureTicks using poolTicks (DP so it never gets stuck).
- */
 function fillMeasureTicks(measureTicks, poolTicks) {
   const pool = [...new Set(poolTicks)].filter((t) => t > 0).sort((a, b) => a - b);
-
   const memo = new Map();
+
   function canFill(rem) {
     if (rem === 0) return true;
     if (rem < 0) return false;
@@ -270,9 +260,7 @@ function fillMeasureTicks(measureTicks, poolTicks) {
     return ok;
   }
 
-  if (!canFill(measureTicks)) {
-    return fillMeasureTicks(measureTicks, DUR_TICKS);
-  }
+  if (!canFill(measureTicks)) return fillMeasureTicks(measureTicks, DUR_TICKS);
 
   const out = [];
   let rem = measureTicks;
@@ -284,30 +272,20 @@ function fillMeasureTicks(measureTicks, poolTicks) {
     out.push(pick);
     rem -= pick;
   }
-
   return out;
 }
 
 function ticksToDuration(ticks) {
   switch (ticks) {
-    case 16:
-      return { dur: "w", dots: 0 };
-    case 12:
-      return { dur: "h", dots: 1 };
-    case 8:
-      return { dur: "h", dots: 0 };
-    case 6:
-      return { dur: "q", dots: 1 };
-    case 4:
-      return { dur: "q", dots: 0 };
-    case 3:
-      return { dur: "8", dots: 1 };
-    case 2:
-      return { dur: "8", dots: 0 };
-    case 1:
-      return { dur: "16", dots: 0 };
-    default:
-      return null;
+    case 16: return { dur: "w", dots: 0 };
+    case 12: return { dur: "h", dots: 1 };
+    case 8:  return { dur: "h", dots: 0 };
+    case 6:  return { dur: "q", dots: 1 };
+    case 4:  return { dur: "q", dots: 0 };
+    case 3:  return { dur: "8", dots: 1 };
+    case 2:  return { dur: "8", dots: 0 };
+    case 1:  return { dur: "16", dots: 0 };
+    default: return null;
   }
 }
 
@@ -331,13 +309,11 @@ function upsertTarget(targetsByTick, startTick, leadInBeats) {
 }
 
 function addMidisToTarget(target, midis) {
-  const merged = [...new Set([...target.midis, ...midis])].sort((a, b) => a - b);
-  target.midis = merged;
+  target.midis = [...new Set([...target.midis, ...midis])].sort((a, b) => a - b);
 }
 
 function generatePiece(targetCount, { key, maxPoly, difficulty }) {
   const scale = buildScale(key);
-
   const [num, den] = state.timeSig.split("/").map(Number);
   const beatsPerMeasure = num * (4 / den);
   const measureTicks = beatsToTicks(beatsPerMeasure);
@@ -350,13 +326,11 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
   const targetsByTick = new Map();
 
   let treblePrev = 72; // C5
-  let bassPrev = 48; // C3
+  let bassPrev = 48;   // C3
 
-  const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat; // typically 0
+  const leadInBeats = (layout.leadInPx - layout.playheadX) / pxPerBeat;
 
-  // conservative: keep generating until we have enough playable targets
   let measuresToGenerate = Math.max(1, Math.ceil(targetCount / Math.max(1, measureTicks)));
-
   let globalTick = 0;
   let measureIndex = 0;
 
@@ -364,7 +338,7 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
     const trebleDurTicks = fillMeasureTicks(measureTicks, treblePoolTicks);
     const bassDurTicks = fillMeasureTicks(measureTicks, bassPoolTicks);
 
-    // Treble segments
+    // Treble
     let tickInMeasure = 0;
     for (const ticks of trebleDurTicks) {
       const startTick = globalTick + tickInMeasure;
@@ -385,7 +359,7 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
         offsetBeats: ticksToBeats(startTick) + leadInBeats,
         offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
         beats,
-        midis, // [] => rest
+        midis,
       });
 
       if (midis.length) {
@@ -396,7 +370,7 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
       tickInMeasure += ticks;
     }
 
-    // Bass segments
+    // Bass
     tickInMeasure = 0;
     for (const ticks of bassDurTicks) {
       const startTick = globalTick + tickInMeasure;
@@ -417,7 +391,7 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
         offsetBeats: ticksToBeats(startTick) + leadInBeats,
         offsetPx: layout.leadInPx + ticksToBeats(startTick) * pxPerBeat,
         beats,
-        midis, // [] => rest
+        midis,
       });
 
       if (midis.length) {
@@ -440,13 +414,12 @@ function generatePiece(targetCount, { key, maxPoly, difficulty }) {
   return { trebleSeq, bassSeq, targets, preferSharps: scale.preferSharps };
 }
 
-/* ------------------------- Rendering ------------------------- */
+/* ------------------------- VexFlow rendering helpers ------------------------- */
 
 function noteToKeys(midis, preferSharps) {
   return midis.map((m) => midiToVex(m, preferSharps));
 }
 
-// Split remaining ticks into legal durations (greedy works because DUR_TICKS is canonical here)
 function splitTicks(remTicks) {
   const out = [];
   let r = remTicks;
@@ -461,7 +434,6 @@ function splitTicks(remTicks) {
 
 function attachDotsForDisplay(note, dots) {
   if (!dots) return;
-  // ticks are handled by `dots:` in constructor; this is display only. :contentReference[oaicite:6]{index=6}
   if (VF.Dot?.buildAndAttach) {
     for (let i = 0; i < dots; i++) VF.Dot.buildAndAttach([note]);
   } else if (VF.Dot) {
@@ -470,18 +442,9 @@ function attachDotsForDisplay(note, dots) {
 }
 
 function makeStaveNote({ clef, keys, dur, dots, stem_direction, isRest }) {
-  // Prefer explicit `dots:` so intrinsic ticks are correct in strict mode. :contentReference[oaicite:7]{index=7}
-  const base = {
-    clef,
-    keys,
-    duration: dur,
-    dots: dots || 0,
-    stem_direction,
-  };
-
+  const base = { clef, keys, duration: dur, dots: dots || 0, stem_direction };
   let n = null;
 
-  // Some builds support `type: "r"`; others rely on duration suffix "r".
   if (isRest) {
     try {
       n = new VF.StaveNote({ ...base, type: "r" });
@@ -492,9 +455,46 @@ function makeStaveNote({ clef, keys, dur, dots, stem_direction, isRest }) {
     n = new VF.StaveNote(base);
   }
 
+  // Intrinsic ticks come from dots:; these dots are display only.
   attachDotsForDisplay(n, dots || 0);
   return n;
 }
+
+function getThemeColor(varName, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  return v || fallback;
+}
+
+function applyMarkToVfNote(vfNote, id) {
+  const mark = state.renderMarks.get(id);
+  if (!mark) return;
+
+  const color =
+    mark === "mistake"
+      ? getThemeColor("--danger", "#e11d48")
+      : getThemeColor("--success", "#16a34a");
+
+  const style = { fillStyle: color, strokeStyle: color };
+
+  // Documented APIs for coloring notes. :contentReference[oaicite:3]{index=3}
+  if (typeof vfNote.setStyle === "function") vfNote.setStyle(style);
+  if (typeof vfNote.setStemStyle === "function") vfNote.setStemStyle(style);
+  if (typeof vfNote.setFlagStyle === "function") vfNote.setFlagStyle(style);
+
+  // Ensure each head is colored even if setStyle misses something in your bundled build.
+  if (typeof vfNote.setKeyStyle === "function" && Array.isArray(vfNote.keys)) {
+    for (let i = 0; i < vfNote.keys.length; i++) vfNote.setKeyStyle(i, style);
+  }
+}
+
+function rerenderPreserveScroll() {
+  const prevTransform = scoreEl.style.transform;
+  renderStaticClefs(state.key);
+  renderSequence(state.trebleSeq, state.bassSeq, state.key);
+  scoreEl.style.transform = prevTransform;
+}
+
+/* ------------------------- Render score (measures) ------------------------- */
 
 function renderSequence(trebleSeq, bassSeq, key) {
   if (!VF) return;
@@ -525,16 +525,9 @@ function renderSequence(trebleSeq, bassSeq, key) {
   const trebleByMeasure = Array.from({ length: measureCount }, () => []);
   const bassByMeasure = Array.from({ length: measureCount }, () => []);
 
-  trebleSeq.forEach((ev) => {
-    const idx = Math.floor(ev.startTick / measureTicks);
-    trebleByMeasure[idx]?.push(ev);
-  });
-  bassSeq.forEach((ev) => {
-    const idx = Math.floor(ev.startTick / measureTicks);
-    bassByMeasure[idx]?.push(ev);
-  });
+  trebleSeq.forEach((ev) => trebleByMeasure[Math.floor(ev.startTick / measureTicks)]?.push(ev));
+  bassSeq.forEach((ev) => bassByMeasure[Math.floor(ev.startTick / measureTicks)]?.push(ev));
 
-  // Ensure chronological order inside each measure.
   for (let i = 0; i < measureCount; i++) {
     trebleByMeasure[i].sort((a, b) => a.startTick - b.startTick);
     bassByMeasure[i].sort((a, b) => a.startTick - b.startTick);
@@ -583,59 +576,41 @@ function renderSequence(trebleSeq, bassSeq, key) {
 
     const keySig = state.keySig;
 
+    function ensureMeasureFill(arr, restIdPrefix) {
+      let sumTicks = 0;
+      for (const ev of arr) sumTicks += beatsToTicks(ev.beats);
+      if (sumTicks >= measureTicks) return;
+
+      const extra = splitTicks(measureTicks - sumTicks);
+      let cursorTick = m * measureTicks + sumTicks;
+      for (const t of extra) {
+        arr.push({
+          id: `${restIdPrefix}-${m}-${Math.random().toString(16).slice(2)}`,
+          startTick: cursorTick,
+          beats: ticksToBeats(t),
+          midis: [],
+        });
+        cursorTick += t;
+      }
+      arr.sort((a, b) => a.startTick - b.startTick);
+    }
+
+    ensureMeasureFill(trebleByMeasure[m], "fill-t");
+    ensureMeasureFill(bassByMeasure[m], "fill-b");
+
     const trebleNotes = [];
     const bassNotes = [];
 
-    // Build treble tickables + ensure exact fill
-    {
-      let sumTicks = 0;
-      trebleByMeasure[m].forEach((ev) => (sumTicks += beatsToTicks(ev.beats)));
-      if (sumTicks < measureTicks) {
-        // Safety net: fill remainder with rests so STRICT won't throw. :contentReference[oaicite:8]{index=8}
-        const extra = splitTicks(measureTicks - sumTicks);
-        extra.forEach((t) => {
-          trebleByMeasure[m].push({
-            id: `fill-t-${m}-${Math.random().toString(16).slice(2)}`,
-            startTick: m * measureTicks + (sumTicks += t) - t, // place at end
-            beats: ticksToBeats(t),
-            midis: [],
-          });
-        });
-        trebleByMeasure[m].sort((a, b) => a.startTick - b.startTick);
-      }
-    }
-
-    {
-      let sumTicks = 0;
-      bassByMeasure[m].forEach((ev) => (sumTicks += beatsToTicks(ev.beats)));
-      if (sumTicks < measureTicks) {
-        const extra = splitTicks(measureTicks - sumTicks);
-        extra.forEach((t) => {
-          bassByMeasure[m].push({
-            id: `fill-b-${m}-${Math.random().toString(16).slice(2)}`,
-            startTick: m * measureTicks + (sumTicks += t) - t,
-            beats: ticksToBeats(t),
-            midis: [],
-          });
-        });
-        bassByMeasure[m].sort((a, b) => a.startTick - b.startTick);
-      }
-    }
-
-    // Treble notes
     trebleByMeasure[m].forEach((ev) => {
       const ticks = beatsToTicks(ev.beats);
       const dur = ticksToDuration(ticks);
-      if (!dur) {
-        console.error("Unrenderable treble duration", ev.beats, "ticks=", ticks);
-        return;
-      }
+      if (!dur) return;
 
-      const trebleKeys = noteToKeys(ev.midis, state.preferSharps);
-      const tNote = trebleKeys.length
+      const keys = noteToKeys(ev.midis, state.preferSharps);
+      const note = keys.length
         ? makeStaveNote({
             clef: "treble",
-            keys: trebleKeys.map((k) => k.key),
+            keys: keys.map((k) => k.key),
             dur: dur.dur,
             dots: dur.dots,
             stem_direction: STEM_UP,
@@ -650,31 +625,29 @@ function renderSequence(trebleSeq, bassSeq, key) {
             isRest: true,
           });
 
-      // Accidentals (only when they differ from key signature)
-      trebleKeys.forEach((k, idx) => {
+      // Apply mark color BEFORE drawing. :contentReference[oaicite:4]{index=4}
+      applyMarkToVfNote(note, ev.id);
+
+      keys.forEach((k, idx) => {
         const letter = k.key[0].toUpperCase();
         if (k.accidental && keySig.get(letter) !== k.accidental) {
-          tNote.addModifier(new VF.Accidental(k.accidental), idx);
+          note.addModifier(new VF.Accidental(k.accidental), idx);
         }
       });
 
-      trebleNotes.push({ note: tNote, ev });
+      trebleNotes.push({ note, ev });
     });
 
-    // Bass notes
     bassByMeasure[m].forEach((ev) => {
       const ticks = beatsToTicks(ev.beats);
       const dur = ticksToDuration(ticks);
-      if (!dur) {
-        console.error("Unrenderable bass duration", ev.beats, "ticks=", ticks);
-        return;
-      }
+      if (!dur) return;
 
-      const bassKeys = noteToKeys(ev.midis, state.preferSharps);
-      const bNote = bassKeys.length
+      const keys = noteToKeys(ev.midis, state.preferSharps);
+      const note = keys.length
         ? makeStaveNote({
             clef: "bass",
-            keys: bassKeys.map((k) => k.key),
+            keys: keys.map((k) => k.key),
             dur: dur.dur,
             dots: dur.dots,
             stem_direction: STEM_DOWN,
@@ -689,17 +662,19 @@ function renderSequence(trebleSeq, bassSeq, key) {
             isRest: true,
           });
 
-      bassKeys.forEach((k, idx) => {
+      applyMarkToVfNote(note, ev.id);
+
+      keys.forEach((k, idx) => {
         const letter = k.key[0].toUpperCase();
         if (k.accidental && keySig.get(letter) !== k.accidental) {
-          bNote.addModifier(new VF.Accidental(k.accidental), idx);
+          note.addModifier(new VF.Accidental(k.accidental), idx);
         }
       });
 
-      bassNotes.push({ note: bNote, ev });
+      bassNotes.push({ note, ev });
     });
 
-    // STRICT: ticks must fill voice or VexFlow throws IncompleteVoice. :contentReference[oaicite:9]{index=9}
+    // STRICT mode throws if incomplete. :contentReference[oaicite:5]{index=5}
     const trebleVoice = new VF.Voice({ num_beats: num, beat_value: den }).setStrict(true);
     trebleVoice.addTickables(trebleNotes.map((n) => n.note));
 
@@ -735,27 +710,22 @@ function renderSequence(trebleSeq, bassSeq, key) {
     trebleBeams.forEach((b) => b.setContext(ctx).draw());
     bassBeams.forEach((b) => b.setContext(ctx).draw());
 
-    // Tag rendered SVG groups for highlighting/mistakes
-    trebleNotes.forEach(({ note, ev }) => {
-      const el = note.attrs?.el;
-      if (el) {
-        el.dataset.id = ev.id;
-        el.classList.add("note-group");
-      }
-    });
-    bassNotes.forEach(({ note, ev }) => {
-      const el = note.attrs?.el;
-      if (el) {
-        el.dataset.id = ev.id;
-        el.classList.add("note-group");
-      }
-    });
+    // Optional: tag for "active" CSS class highlighting (not used for red/green).
+    function tagNoteEl(note, ev) {
+      const el = note?.attrs?.el;
+      if (!el) return;
+      el.setAttribute("data-id", ev.id);
+      el.classList.add("note-group");
+    }
+    trebleNotes.forEach(({ note, ev }) => tagNoteEl(note, ev));
+    bassNotes.forEach(({ note, ev }) => tagNoteEl(note, ev));
   }
 }
 
 function renderStaticClefs(key) {
   if (!VF || !staticClefsEl) return;
   staticClefsEl.innerHTML = "";
+
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   const width = 150;
   const height = 260;
@@ -777,7 +747,7 @@ function renderStaticClefs(key) {
   bass.setContext(ctx).draw();
 }
 
-/* ------------------------- Scoring / interaction ------------------------- */
+/* ------------------------- Stats + targets ------------------------- */
 
 function updateStats() {
   correctCountEl.textContent = state.stats.correct;
@@ -806,17 +776,16 @@ function currentTarget() {
   return state.targets.find((ev) => !ev.completed);
 }
 
+/* ------------------------- Marking (now triggers rerender) ------------------------- */
+
 function markCorrect(ev) {
   if (ev.completed) return;
   ev.completed = true;
   ev.waiting = false;
   state.stats.correct += 1;
 
-  const nodes = scoreEl.querySelectorAll(`[data-id="${ev.id}"]`);
-  nodes.forEach((n) => {
-    n.classList.remove("mistake");
-    n.classList.add("correct");
-  });
+  state.renderMarks.set(ev.id, "correct");
+  rerenderPreserveScroll();
 
   updateStats();
 }
@@ -828,8 +797,8 @@ function markMistake(ev, midi) {
   }
   state.tricky.set(midi, (state.tricky.get(midi) || 0) + 1);
 
-  const nodes = scoreEl.querySelectorAll(`[data-id="${ev.id}"]`);
-  nodes.forEach((n) => n.classList.add("mistake"));
+  state.renderMarks.set(ev.id, "mistake");
+  rerenderPreserveScroll();
 
   updateStats();
 
@@ -843,9 +812,7 @@ function checkPlayheadMiss() {
   if (!ev) return;
 
   const lateWindow = 0.1;
-  const isLate = state.progressBeats >= ev.offsetBeats + lateWindow;
-
-  if (!ev.waiting && isLate && ev.hits.size < ev.midis.length) {
+  if (!ev.waiting && state.progressBeats >= ev.offsetBeats + lateWindow && ev.hits.size < ev.midis.length) {
     ev.waiting = true;
     const missing = ev.midis.find((m) => !ev.hits.has(m)) ?? ev.midis[0];
     markMistake(ev, missing);
@@ -854,6 +821,7 @@ function checkPlayheadMiss() {
 }
 
 function highlightCurrent() {
+  // purely cosmetic, if you have CSS for `.active`
   const groups = scoreEl.querySelectorAll(".note-group");
   groups.forEach((g) => g.classList.remove("active"));
 
@@ -862,8 +830,7 @@ function highlightCurrent() {
 
   const lead = 0.25;
   if (state.progressBeats >= ev.offsetBeats - lead) {
-    const nodes = scoreEl.querySelectorAll(`[data-id="${ev.id}"]`);
-    nodes.forEach((n) => n.classList.add("active"));
+    scoreEl.querySelectorAll(`[data-id="${ev.id}"]`).forEach((n) => n.classList.add("active"));
   }
 }
 
@@ -894,11 +861,10 @@ function connectMidiInput(id) {
   state.midiInputId = id;
   state.midiInputs.forEach((inp) => (inp.onmidimessage = null));
   let target = null;
-  if (!id || id === "auto") {
-    target = state.midiInputs[0];
-  } else {
-    target = state.midiInputs.find((i) => i.id === id);
-  }
+
+  if (!id || id === "auto") target = state.midiInputs[0];
+  else target = state.midiInputs.find((i) => i.id === id);
+
   if (target) {
     target.onmidimessage = handleMidiMessage;
     midiStatusEl.textContent = `MIDI: ${target.name}`;
@@ -913,23 +879,26 @@ function refreshMidiInputs(access) {
   state.midiAccess = access;
   state.midiInputs = [];
   access.inputs.forEach((i) => state.midiInputs.push(i));
+
   midiSelect.innerHTML = "";
   const autoOpt = document.createElement("option");
   autoOpt.value = "auto";
   autoOpt.textContent = state.midiInputs.length ? "Auto (first available)" : "No devices";
   midiSelect.appendChild(autoOpt);
   midiSelect.disabled = state.midiInputs.length === 0;
+
   state.midiInputs.forEach((i) => {
     const opt = document.createElement("option");
     opt.value = i.id;
     opt.textContent = i.name;
     midiSelect.appendChild(opt);
   });
-  if (state.midiInputId && state.midiInputs.find((i) => i.id === state.midiInputId)) {
-    midiSelect.value = state.midiInputId;
-  } else {
-    midiSelect.value = "auto";
-  }
+
+  midiSelect.value =
+    state.midiInputId && state.midiInputs.find((i) => i.id === state.midiInputId)
+      ? state.midiInputId
+      : "auto";
+
   connectMidiInput(midiSelect.value);
   console.info("MIDI inputs detected:", state.midiInputs.map((i) => i.name));
 }
@@ -962,11 +931,8 @@ async function initMIDI() {
       );
     }
   } catch (e) {
-    if (e && e.name === "NotAllowedError") {
-      midiStatusEl.textContent = "MIDI blocked: allow in site settings/padlock";
-    } else {
-      midiStatusEl.textContent = "MIDI: permission denied";
-    }
+    if (e && e.name === "NotAllowedError") midiStatusEl.textContent = "MIDI blocked: allow in site settings/padlock";
+    else midiStatusEl.textContent = "MIDI: permission denied";
     midiStatusEl.classList.add("warn");
     console.error("MIDI access error:", e);
   }
@@ -987,6 +953,7 @@ function refreshLayout() {
 function tick(now) {
   const delta = (now - lastFrame) / 1000;
   lastFrame = now;
+
   if (state.running && !userPaused) {
     state.progressBeats += (state.bpm / 60) * delta;
     const translate = -state.progressBeats * pxPerBeat;
@@ -994,6 +961,7 @@ function tick(now) {
     checkPlayheadMiss();
     highlightCurrent();
   }
+
   requestAnimationFrame(tick);
 }
 
@@ -1005,6 +973,7 @@ function regenerate() {
   state.progressBeats = 0;
   state.stats = { correct: 0, mistakes: 0 };
   state.tricky = new Map();
+  state.renderMarks = new Map();
   updateStats();
 
   const { trebleSeq, bassSeq, targets, preferSharps } = generatePiece(state.windowSize, {
@@ -1023,9 +992,7 @@ function regenerate() {
   renderStaticClefs(state.key);
   renderSequence(state.trebleSeq, state.bassSeq, state.key);
 
-  scoreEl.querySelectorAll(".note-group").forEach((g) => g.classList.remove("active"));
-  scoreEl.style.transform = "translateX(0px)";
-
+  scoreEl.style.transform = `translateX(0px)`;
   lastFrame = performance.now();
   state.running = true;
 }
