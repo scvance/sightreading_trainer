@@ -158,8 +158,11 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
   const events = [];
   let treblePrev = 72; // C5
   let bassPrev = 48; // C3
+  const [num, den] = state.timeSig.split("/").map(Number);
+  const beatsPerMeasure = num * (4 / den);
   const durPool = difficulty === "hard" ? [0.5, 0.5, 1, 1, 1.5, 2] : difficulty === "medium" ? [0.5, 1, 1, 1, 2] : [1, 1, 1, 2];
   const spice = difficulty === "hard" ? 0.45 : difficulty === "medium" ? 0.3 : 0.18;
+  let measureBeat = 0;
 
   for (let i = 0; i < count; i++) {
     const chordSize = Math.max(1, Math.round(Math.random() * (maxPoly - 1)) + 1);
@@ -175,8 +178,21 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
       }
     }
     const uniqueMidis = [...new Set(midis)].sort((a, b) => a - b);
-    const beats = durPool[Math.floor(Math.random() * durPool.length)];
+    let beats = durPool[Math.floor(Math.random() * durPool.length)];
+    const remaining = beatsPerMeasure - measureBeat;
+    if (beats > remaining + 1e-6) {
+      if (remaining >= 0.5) {
+        beats = remaining;
+      } else {
+        measureBeat = 0;
+        beats = Math.min(beats, beatsPerMeasure);
+      }
+    }
     events.push({ id: `ev-${i}-${Date.now()}`, midis: uniqueMidis, beats, hits: new Set(), mistakeFlag: false, waiting: false });
+    measureBeat += beats;
+    if (measureBeat >= beatsPerMeasure - 1e-6) {
+      measureBeat = 0;
+    }
   }
 
   let cumulative = 0;
@@ -207,6 +223,7 @@ function renderSequence(seq, key) {
   scoreEl.style.width = `${Math.max(totalWidth, minWidth)}px`;
   scoreEl.style.height = "100%";
   let currentMeasure = -1;
+  let prevMeasureIdx = null;
   seq.forEach((ev, idx) => {
     const group = document.createElement("div");
     group.className = "note-group";
@@ -226,13 +243,24 @@ function renderSequence(seq, key) {
     const ctx = renderer.getContext();
     ctx.setFont("Inter", 12, "");
 
-    const treble = new VF.Stave(0, 24, width);
-    const bass = new VF.Stave(0, 130, width);
-    treble.setContext(ctx).draw();
-    bass.setContext(ctx).draw();
-
     // measure number overlay
     const measureIdx = Math.floor((ev.offsetBeats - leadInBeats + 1e-6) / beatsPerMeasure) + 1;
+    const isMeasureStart = prevMeasureIdx === null || measureIdx !== prevMeasureIdx;
+    prevMeasureIdx = measureIdx;
+
+    const treble = new VF.Stave(0, 24, width);
+    const bass = new VF.Stave(0, 130, width);
+
+    // Only show barlines at measure boundaries
+    const barNone = VF.Barline?.type?.NONE ?? VF.Barline.type.NONE;
+    const barSingle = VF.Barline?.type?.SINGLE ?? VF.Barline.type.SINGLE;
+    treble.setBegBarType(isMeasureStart ? barSingle : barNone);
+    treble.setEndBarType(barNone);
+    bass.setBegBarType(isMeasureStart ? barSingle : barNone);
+    bass.setEndBarType(barNone);
+
+    treble.setContext(ctx).draw();
+    bass.setContext(ctx).draw();
     if (measureIdx !== currentMeasure) {
       currentMeasure = measureIdx;
       const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
