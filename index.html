@@ -46,17 +46,19 @@
         <label>&nbsp;</label>
         <button id="midi-connect">Connect MIDI</button>
       </div>
-      <div class="control">
+      <div class="control control-wide">
         <label>Difficulty</label>
-        <div class="chips" id="difficulty">
-          <button data-diff="easy" class="chip active">Easy</button>
-          <button data-diff="medium" class="chip">Medium</button>
-          <button data-diff="hard" class="chip">Hard</button>
+        <div class="row-spread">
+          <div class="chips" id="difficulty">
+            <button data-diff="easy" class="chip active">Easy</button>
+            <button data-diff="medium" class="chip">Medium</button>
+            <button data-diff="hard" class="chip">Hard</button>
+          </div>
+          <div class="buttons-row">
+            <button id="regenerate">Regenerate</button>
+            <button id="toggle-run">Pause</button>
+          </div>
         </div>
-      </div>
-      <div class="control">
-        <button id="regenerate">Regenerate</button>
-        <button id="toggle-run">Pause</button>
       </div>
     </section>
 
