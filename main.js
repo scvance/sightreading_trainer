@@ -51,6 +51,14 @@ const staticClefsEl = document.getElementById("static-clefs");
 let layout = { playheadX: 120, leadInPx: 120 };
 const pxPerBeat = 90;
 
+const INPUT_TIMING = {
+  // User can play at most this many beats early. Earlier than this is ignored.
+  earlyWindowBeats: 0.18,   // ~ a 16th-note early (tweak 0.10..0.30)
+  // Keep your miss window separate (used in checkPlayheadMiss)
+  lateWindowBeats: 0.12,
+};
+
+
 let state = {
   bpm: Number(bpmRange.value),
   key: "C",
@@ -1495,7 +1503,7 @@ function renderSequence(trebleSeq, bassSeq, key) {
   for (let m = 0; m < measureCount; m++) {
     const group = document.createElement("div");
     group.style.position = "absolute";
-    group.style.left = `${layout.leadInPx + m * measureWidth}px`;
+    group.style.left = "0px";
 
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     const width = measureWidth;
@@ -1524,6 +1532,11 @@ function renderSequence(trebleSeq, bassSeq, key) {
 
     treble.setContext(ctx).draw();
     bass.setContext(ctx).draw();
+
+        // Align beat 0 (first tick context) to the playhead by compensating for VexFlow's internal noteStartX.
+    // This fixes the “note is not on the line when it should be” drift.
+    const noteStartX = typeof treble.getNoteStartX === "function" ? treble.getNoteStartX() : 0;
+    group.style.left = `${layout.leadInPx + m * measureWidth - noteStartX}px`;
 
     const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
     txt.setAttribute("x", "4");
@@ -1701,6 +1714,7 @@ function renderStaticClefs(key) {
   const bass = new VF.Stave(0, 130, width);
   bass.addClef("bass").addKeySignature(key).addTimeSignature(state.timeSig);
   bass.setContext(ctx).draw();
+
 }
 
 /* ------------------------- Stats + grading ------------------------- */
@@ -1768,7 +1782,7 @@ function checkPlayheadMiss() {
   const ev = currentTarget();
   if (!ev) return;
 
-  const lateWindow = 0.1;
+  const lateWindow = INPUT_TIMING.lateWindowBeats;
   if (!ev.waiting && state.progressBeats >= ev.offsetBeats + lateWindow && ev.hits.size < ev.midis.length) {
     ev.waiting = true;
     const missing = ev.midis.find((m) => !ev.hits.has(m)) ?? ev.midis[0];
@@ -1796,6 +1810,15 @@ function handleMidiMessage(msg) {
 
   const ev = currentTarget();
   if (!ev) return;
+
+  const nowBeats = state.progressBeats;
+  const earliestAllowed = ev.offsetBeats - INPUT_TIMING.earlyWindowBeats;
+
+  // Too early for the current target: ignore input so you can't “race ahead”.
+  if (nowBeats < earliestAllowed) {
+    return;
+  }
+
 
   if (ev.midis.includes(pitch)) {
     ev.hits.add(pitch);
