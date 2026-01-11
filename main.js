@@ -110,6 +110,7 @@ function midiToVex(midi, preferSharps) {
 
 function buildScale(key) {
   const rootName = key.replace("b", "b").replace("#", "#");
+  // Prefer flats for C and flat keys; sharps only for positive accidental keys.
   const preferSharps = KEY_INFO[key].accidentals > 0;
   const names = preferSharps ? NOTE_NAMES_SHARP : NOTE_NAMES_FLAT;
   const rootIndex = names.findIndex((n) => n === rootName);
@@ -158,9 +159,9 @@ function generateSequence(count, { key, maxPoly, difficulty }) {
         midis.push(bassPrev);
       }
     }
-    midis.sort((a, b) => a - b);
+    const uniqueMidis = [...new Set(midis)].sort((a, b) => a - b);
     const beats = durPool[Math.floor(Math.random() * durPool.length)];
-    events.push({ id: `ev-${i}-${Date.now()}`, midis, beats, hits: new Set(), mistakeFlag: false, waiting: false });
+    events.push({ id: `ev-${i}-${Date.now()}`, midis: uniqueMidis, beats, hits: new Set(), mistakeFlag: false, waiting: false });
   }
 
   let cumulative = 0;
@@ -310,6 +311,10 @@ function markMistake(ev, midi) {
   const node = scoreEl.querySelector(`[data-id="${ev.id}"]`);
   node?.classList.add("mistake");
   updateStats();
+  // Pause at this note's position so the next note doesn't instantly flag.
+  state.progressBeats = Math.min(state.progressBeats, ev.offsetBeats);
+  const translate = -state.progressBeats * pxPerBeat;
+  scoreEl.style.transform = `translateX(${translate}px)`;
 }
 
 function currentTarget() {
@@ -319,11 +324,22 @@ function currentTarget() {
 function checkPlayheadMiss() {
   const ev = currentTarget();
   if (!ev) return;
-  const tolerance = 0.05; // beats before playhead arrives
-  if (!ev.waiting && state.progressBeats >= ev.offsetBeats - tolerance && ev.hits.size < ev.midis.length) {
+  const lateWindow = 0.1; // beats after playhead
+  if (!ev.waiting && state.progressBeats >= ev.offsetBeats + lateWindow && ev.hits.size < ev.midis.length) {
     ev.waiting = true;
     markMistake(ev, ev.midis[0]);
     state.running = false;
+  }
+}
+
+function highlightCurrent() {
+  const groups = scoreEl.querySelectorAll(".note-group");
+  groups.forEach((g) => g.classList.remove("active"));
+  const ev = currentTarget();
+  if (!ev) return;
+  const lead = 0.25; // beats before playhead to cue readiness
+  if (state.progressBeats >= ev.offsetBeats - lead) {
+    scoreEl.querySelector(`[data-id="${ev.id}"]`)?.classList.add("active");
   }
 }
 
@@ -438,6 +454,7 @@ function tick(now) {
     const translate = -state.progressBeats * pxPerBeat;
     scoreEl.style.transform = `translateX(${translate}px)`;
     checkPlayheadMiss();
+    highlightCurrent();
   }
   requestAnimationFrame(tick);
 }
@@ -457,6 +474,7 @@ function regenerate() {
   state.preferSharps = preferSharps;
   renderStaticClefs(state.key);
   renderSequence(events, state.key);
+  scoreEl.querySelectorAll(".note-group").forEach((g) => g.classList.remove("active"));
   scoreEl.style.transform = `translateX(0px)`;
   lastFrame = performance.now();
   state.running = true;

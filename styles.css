@@ -38,8 +38,8 @@ header p { margin: 4px 0 0; color: var(--muted); }
 .chip.active { border-color: var(--accent); color: #0b1020; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
 
 main { display: grid; grid-template-columns: 2fr 320px; gap: 16px; align-items: start; }
-.score-wrapper { position: relative; background: #fffef8; border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); height: 320px; border: 1px solid #e5e7eb; }
-.score { position: absolute; inset: 0; display: flex; align-items: flex-start; gap: 12px; padding: 16px 16px 16px 0; background: linear-gradient(90deg, #fffef8 60%, rgba(255,255,255,0)); }
+.score-wrapper { position: relative; background: #fffef8; border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); height: 360px; border: 1px solid #e5e7eb; }
+.score { position: absolute; inset: 0; display: flex; align-items: flex-start; gap: 12px; padding: 16px 16px 32px 0; background: linear-gradient(90deg, #fffef8 60%, rgba(255,255,255,0)); }
 .playhead { position: absolute; top: 0; bottom: 0; width: 2px; left: 120px; background: var(--accent); box-shadow: 0 0 0 6px rgba(0, 102, 255, 0.15); z-index: 2; }
 .static-clefs { position: absolute; left: 0; top: 0; bottom: 0; width: 120px; background: #fffef8; border-right: 1px solid #e5e7eb; padding: 16px 8px; display: flex; align-items: flex-start; justify-content: center; z-index: 1; pointer-events: none; }
 .placeholder { color: var(--muted); padding: 24px; font-style: italic; }
@@ -56,6 +56,7 @@ main { display: grid; grid-template-columns: 2fr 320px; gap: 16px; align-items: 
 .note-group .vf-stavenote path { transition: fill 0.2s; }
 .note-group.correct .vf-stavenote path { fill: var(--success); }
 .note-group.mistake .vf-stavenote path { fill: var(--danger); }
+.note-group.active { transform: scale(1.02); filter: drop-shadow(0 0 10px rgba(0,102,255,0.3)); transition: transform 0.15s ease, filter 0.15s ease; }
 
 @keyframes shake {
   0% { transform: translateX(0); }
