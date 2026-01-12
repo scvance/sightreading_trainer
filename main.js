@@ -50,6 +50,7 @@ const staticClefsEl = document.getElementById("static-clefs");
 
 let layout = { playheadX: 120, leadInPx: 120 };
 const pxPerBeat = 90;
+layout.notePadPx = 0;
 
 const INPUT_TIMING = {
   // User can play at most this many beats early. Earlier than this is ignored.
@@ -258,6 +259,8 @@ function computePlaybackEvents() {
 async function startPlaybackFromBeginning() {
   // Always restart to keep scroll + audio aligned.
   restartScrollAndExercise(/*preserveStats=*/false);
+  state.progressBeats = 0;
+  updateScrollTransform();
 
   if (playback.isPlaying) {
     stopPlayback();
@@ -1482,7 +1485,7 @@ function renderSequence(trebleSeq, bassSeq, key) {
   const maxStartTick = allSeq.reduce((acc, ev) => Math.max(acc, ev.startTick), 0);
   const measureCount = Math.floor(maxStartTick / measureTicks) + 1;
 
-  const measureWidth = Math.max(200, Math.ceil(beatsPerMeasure * pxPerBeat) + 40);
+  const measureWidth = Math.max(200, Math.ceil(beatsPerMeasure * pxPerBeat));
   const minWidth = scoreWrapper?.clientWidth || 800;
   const totalWidth = layout.leadInPx + (measureCount + 1) * measureWidth;
 
@@ -1536,6 +1539,7 @@ function renderSequence(trebleSeq, bassSeq, key) {
         // Align beat 0 (first tick context) to the playhead by compensating for VexFlow's internal noteStartX.
     // This fixes the “note is not on the line when it should be” drift.
     const noteStartX = typeof treble.getNoteStartX === "function" ? treble.getNoteStartX() : 0;
+    if (m === 0) layout.notePadPx = noteStartX;
     group.style.left = `${layout.leadInPx + m * measureWidth - noteStartX}px`;
 
     const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
@@ -1754,6 +1758,12 @@ function markCorrect(ev) {
   ev.waiting = false;
   state.stats.correct += 1;
 
+  // Keep scroll aligned with the latest cleared event, even if played early.
+  if (state.progressBeats < ev.offsetBeats - 0.1) {
+    state.progressBeats = ev.offsetBeats;
+    updateScrollTransform();
+  }
+
   state.renderMarks.set(ev.id, "correct");
   rerenderPreserveScroll();
 
@@ -1772,10 +1782,9 @@ function markMistake(ev, midi) {
 
   updateStats();
 
-  // Pause at this onset so the next target doesn't instantly flag.
-  state.progressBeats = Math.min(state.progressBeats, ev.offsetBeats);
-  const translate = -state.progressBeats * pxPerBeat;
-  scoreEl.style.transform = `translateX(${translate}px)`;
+  // Keep scroll aligned with the missed onset; don't let it hang behind.
+  state.progressBeats = Math.max(state.progressBeats, ev.offsetBeats);
+  updateScrollTransform();
 }
 
 function checkPlayheadMiss() {
@@ -1921,13 +1930,18 @@ function refreshLayout() {
   document.documentElement.style.setProperty("--playhead-left", `${layout.playheadX}px`);
 }
 
+function updateScrollTransform() {
+  const pad = layout.notePadPx || 0;
+  const translate = layout.playheadX - layout.leadInPx - pad - state.progressBeats * pxPerBeat + 12; // small bias right of playhead
+  scoreEl.style.transform = `translateX(${translate}px)`;
+}
+
 function tick(now) {
   const delta = (now - lastFrame) / 1000;
   lastFrame = now;
   if (state.running && !userPaused) {
     state.progressBeats += (state.bpm / 60) * delta;
-    const translate = -state.progressBeats * pxPerBeat;
-    scoreEl.style.transform = `translateX(${translate}px)`;
+    updateScrollTransform();
     if (!playback.isPlaying) {
       checkPlayheadMiss();
     }
@@ -1940,7 +1954,7 @@ function tick(now) {
 
 function restartScrollAndExercise(preserveStats = false) {
   state.progressBeats = 0;
-  scoreEl.style.transform = `translateX(0px)`;
+  updateScrollTransform();
   lastFrame = performance.now();
 
   state.targets.forEach((t) => {
@@ -2009,7 +2023,7 @@ function regenerate() {
   renderStaticClefs(state.key);
   renderSequence(state.trebleSeq, state.bassSeq, state.key);
 
-  scoreEl.style.transform = `translateX(0px)`;
+  updateScrollTransform();
   lastFrame = performance.now();
   state.running = true;
 }
